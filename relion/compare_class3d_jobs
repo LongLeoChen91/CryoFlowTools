@@ -1,0 +1,650 @@
+#!/apps/strubi/software/packages/miniforge3/envs/miss-alignment/bin/python
+
+"""
+compare_class3d_jobs
+
+Compare particle class assignments between two RELION Class3D
+*_data.star files.
+
+The script matches particles using rlnTomoParticleName and reports:
+
+    - total particle count in each STAR file
+    - particle count and percentage in each class
+    - number of particles shared between the two STAR files
+    - particles present only in either STAR file
+    - class-assignment overlap matrix for shared particles
+    - row-normalised overlap percentages
+    - column-normalised overlap percentages
+    - per-particle class assignments across the two classifications
+
+The two input STAR files are specified explicitly so that both the
+RELION job and iteration being compared are unambiguous.
+
+Usage:
+    compare_class3d_jobs STAR_FILE_A STAR_FILE_B
+
+Examples:
+    compare_class3d_jobs \
+        Class3D/job020/run_it025_data.star \
+        Class3D/job025/run_it022_data.star
+
+    compare_class3d_jobs \
+        Class3D/job020/run_it010_data.star \
+        Class3D/job020/run_it025_data.star
+
+Optional output directory:
+    compare_class3d_jobs \
+        Class3D/job020/run_it025_data.star \
+        Class3D/job025/run_it022_data.star \
+        -o class_overlap_analysis
+
+Notes:
+    Particle identity is determined by rlnTomoParticleName.
+
+    Class numbers are treated only as RELION class indices. No attempt
+    is made to determine whether classes from the two classifications
+    represent the same biological or structural state.
+
+    Row- and column-normalised percentages are calculated using particles
+    shared between the two input STAR files.
+
+Developed and maintained by Long Chen.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+
+import pandas as pd
+import starfile
+
+
+def extract_label(star_path: Path) -> str:
+    """
+    Generate a readable label from a RELION Class3D STAR path.
+
+    Example:
+        Class3D/job020/run_it025_data.star
+            -> job020_it025
+
+    If the expected RELION naming convention cannot be identified,
+    a label is generated from the parent directory and filename.
+    """
+
+    job_match = None
+
+    for part in reversed(star_path.parts):
+        match = re.fullmatch(r"job(\d+)", part)
+
+        if match:
+            job_match = match
+            break
+
+    iteration_match = re.search(
+        r"run_it(\d+)_data\.star$",
+        star_path.name,
+    )
+
+    if job_match and iteration_match:
+        job_number = int(job_match.group(1))
+        iteration = int(iteration_match.group(1))
+
+        return f"job{job_number:03d}_it{iteration:03d}"
+
+    if iteration_match:
+        iteration = int(iteration_match.group(1))
+
+        parent = re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "_",
+            star_path.parent.name,
+        )
+
+        return f"{parent}_it{iteration:03d}"
+
+    return re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "_",
+        star_path.stem,
+    )
+
+
+def read_particles(path: Path) -> pd.DataFrame:
+    """
+    Read particle identifiers and class assignments from a RELION STAR file.
+
+    Required columns:
+        rlnTomoParticleName
+        rlnClassNumber
+
+    Each particle identifier must occur exactly once.
+    """
+
+    blocks = starfile.read(
+        path,
+        always_dict=True,
+    )
+
+    if "particles" not in blocks:
+        raise RuntimeError(
+            f"No 'particles' block found in {path}"
+        )
+
+    df = blocks["particles"].copy()
+
+    required_columns = [
+        "rlnTomoParticleName",
+        "rlnClassNumber",
+    ]
+
+    missing = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise RuntimeError(
+            f"{path} is missing required columns: {missing}"
+        )
+
+    duplicate_mask = df[
+        "rlnTomoParticleName"
+    ].duplicated()
+
+    if duplicate_mask.any():
+        examples = (
+            df.loc[
+                duplicate_mask,
+                "rlnTomoParticleName",
+            ]
+            .head()
+            .tolist()
+        )
+
+        raise RuntimeError(
+            f"Duplicate particle IDs found in {path}: "
+            f"{examples}"
+        )
+
+    df["rlnClassNumber"] = (
+        df["rlnClassNumber"].astype(int)
+    )
+
+    return (
+        df[
+            [
+                "rlnTomoParticleName",
+                "rlnClassNumber",
+            ]
+        ]
+        .rename(
+            columns={
+                "rlnClassNumber": "class",
+            }
+        )
+        .copy()
+    )
+
+
+def class_counts(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return particle count and percentage for each class.
+    """
+
+    counts = (
+        df["class"]
+        .value_counts()
+        .sort_index()
+        .rename("count")
+        .reset_index()
+    )
+
+    counts.columns = [
+        "class",
+        "count",
+    ]
+
+    counts["percent"] = (
+        counts["count"]
+        / len(df)
+        * 100.0
+    ).round(2)
+
+    return counts
+
+
+def overlap_crosstab(
+    merged: pd.DataFrame,
+    label_a: str,
+    label_b: str,
+) -> pd.DataFrame:
+    """
+    Build a class-overlap matrix for particles shared by both STAR files.
+
+    Rows correspond to classes in classification A.
+    Columns correspond to classes in classification B.
+
+    Each cell contains the number of shared particles assigned to that
+    pair of classes.
+    """
+
+    classes_a = sorted(
+        merged["class_A"].unique()
+    )
+
+    classes_b = sorted(
+        merged["class_B"].unique()
+    )
+
+    matrix = pd.crosstab(
+        merged["class_A"],
+        merged["class_B"],
+        rownames=[f"Class_{label_a}"],
+        colnames=[f"Class_{label_b}"],
+    )
+
+    matrix = matrix.reindex(
+        index=classes_a,
+        columns=classes_b,
+        fill_value=0,
+    )
+
+    return matrix
+
+def print_class_counts(
+    label: str,
+    df: pd.DataFrame,
+    counts: pd.DataFrame,
+) -> None:
+    """
+    Print per-class particle counts for one classification.
+    """
+
+    print(
+        f"{label}  "
+        f"({len(df)} particles total)"
+    )
+
+    print("  Per-class counts:")
+
+    for class_number, count, percent in counts.itertuples(
+        index=False,
+        name=None,
+    ):
+        print(
+            f"    Class {class_number}: "
+            f"{count:>7d}  "
+            f"({percent:6.2f}%)"
+        )
+
+    print()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare particle class assignments between two "
+            "RELION Class3D *_data.star files."
+        )
+    )
+
+    parser.add_argument(
+        "star_file_a",
+        type=Path,
+        help=(
+            "First RELION Class3D *_data.star file."
+        ),
+    )
+
+    parser.add_argument(
+        "star_file_b",
+        type=Path,
+        help=(
+            "Second RELION Class3D *_data.star file."
+        ),
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=Path("class_overlap_analysis"),
+        help=(
+            "Output directory "
+            "(default: class_overlap_analysis)."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    star_a = args.star_file_a
+    star_b = args.star_file_b
+    output_dir = args.output
+
+    # ------------------------------------------------------------
+    # Validate inputs
+    # ------------------------------------------------------------
+
+    for path in (star_a, star_b):
+        if not path.exists():
+            raise FileNotFoundError(
+                f"STAR file does not exist: {path}"
+            )
+
+        if not path.is_file():
+            raise RuntimeError(
+                f"Expected a STAR file but received: {path}"
+            )
+
+    if star_a.resolve() == star_b.resolve():
+        raise ValueError(
+            "The two input STAR files are identical."
+        )
+
+    label_a = extract_label(star_a)
+    label_b = extract_label(star_b)
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------
+
+    print()
+    print("=" * 72)
+    print("RELION Class3D comparison")
+    print("=" * 72)
+
+    print(f"A: {label_a}")
+    print(f"   {star_a}")
+
+    print(f"B: {label_b}")
+    print(f"   {star_b}")
+
+    print()
+
+    # ------------------------------------------------------------
+    # Read particles
+    # ------------------------------------------------------------
+
+    print("Loading particle assignments...\n")
+
+    data_a = read_particles(star_a)
+    data_b = read_particles(star_b)
+
+    counts_a = class_counts(data_a)
+    counts_b = class_counts(data_b)
+
+    print_class_counts(
+        label_a,
+        data_a,
+        counts_a,
+    )
+
+    print_class_counts(
+        label_b,
+        data_b,
+        counts_b,
+    )
+
+    # Save per-class counts.
+
+    counts_a.to_csv(
+        output_dir
+        / f"{label_a}_class_counts.csv",
+        index=False,
+    )
+
+    counts_b.to_csv(
+        output_dir
+        / f"{label_b}_class_counts.csv",
+        index=False,
+    )
+
+    # ------------------------------------------------------------
+    # Compare particle sets
+    # ------------------------------------------------------------
+
+    ids_a = set(
+        data_a["rlnTomoParticleName"]
+    )
+
+    ids_b = set(
+        data_b["rlnTomoParticleName"]
+    )
+
+    shared_ids = ids_a & ids_b
+    only_a = ids_a - ids_b
+    only_b = ids_b - ids_a
+
+    n_common = len(shared_ids)
+    n_only_a = len(only_a)
+    n_only_b = len(only_b)
+
+    print("=" * 72)
+    print(
+        f"{label_a}  vs  {label_b}"
+    )
+    print("=" * 72)
+
+    print(
+        f"  Total particles in {label_a}: "
+        f"{len(data_a)}"
+    )
+
+    print(
+        f"  Total particles in {label_b}: "
+        f"{len(data_b)}"
+    )
+
+    print(
+        f"  Particles shared by both: "
+        f"{n_common}"
+    )
+
+    print(
+        f"  Only in {label_a}: "
+        f"{n_only_a}"
+    )
+
+    print(
+        f"  Only in {label_b}: "
+        f"{n_only_b}"
+    )
+
+    print()
+
+    if n_common == 0:
+        print(
+            "No common particles were found. "
+            "Skipping class-overlap analysis."
+        )
+
+        return
+
+    # ------------------------------------------------------------
+    # Merge shared particles
+    # ------------------------------------------------------------
+
+    merged = data_a.merge(
+        data_b,
+        on="rlnTomoParticleName",
+        how="inner",
+        suffixes=("_A", "_B"),
+    )
+
+    # ------------------------------------------------------------
+    # Raw overlap matrix
+    # ------------------------------------------------------------
+
+    matrix = overlap_crosstab(
+        merged,
+        label_a,
+        label_b,
+    )
+
+    print("Overlap count matrix")
+    print(
+        f"  rows    = classes in {label_a}"
+    )
+    print(
+        f"  columns = classes in {label_b}"
+    )
+    print(
+        "  cells   = number of shared particles"
+    )
+
+    print()
+    print(matrix.to_string())
+    print()
+
+    # ------------------------------------------------------------
+    # Row-normalised percentages
+    # ------------------------------------------------------------
+
+    row_totals = (
+        matrix.sum(axis=1)
+        .replace(0, pd.NA)
+    )
+
+    row_pct = (
+        matrix
+        .div(row_totals, axis=0)
+        .fillna(0)
+        * 100.0
+    ).round(1)
+
+    print(
+        "Row-normalised overlap (%)"
+    )
+
+    print(
+        f"  For each class in {label_a}, "
+        f"where its shared particles are assigned "
+        f"in {label_b}."
+    )
+
+    print()
+    print(row_pct.to_string())
+    print()
+
+    # ------------------------------------------------------------
+    # Column-normalised percentages
+    # ------------------------------------------------------------
+
+    col_totals = (
+        matrix.sum(axis=0)
+        .replace(0, pd.NA)
+    )
+
+    col_pct = (
+        matrix
+        .div(col_totals, axis=1)
+        .fillna(0)
+        * 100.0
+    ).round(1)
+
+    print(
+        "Column-normalised overlap (%)"
+    )
+
+    print(
+        f"  For each class in {label_b}, "
+        f"where its shared particles came from "
+        f"in {label_a}."
+    )
+
+    print()
+    print(col_pct.to_string())
+    print()
+
+    # ------------------------------------------------------------
+    # Save outputs
+    # ------------------------------------------------------------
+
+    comparison_prefix = (
+        f"{label_a}_vs_{label_b}"
+    )
+
+    prefix = (
+        output_dir
+        / comparison_prefix
+    )
+
+    matrix.to_csv(
+        f"{prefix}_overlap_counts.csv"
+    )
+
+    row_pct.to_csv(
+        f"{prefix}_row_percent.csv"
+    )
+
+    col_pct.to_csv(
+        f"{prefix}_col_percent.csv"
+    )
+
+    assignments = (
+        merged[
+            [
+                "rlnTomoParticleName",
+                "class_A",
+                "class_B",
+            ]
+        ]
+        .rename(
+            columns={
+                "class_A": f"class_{label_a}",
+                "class_B": f"class_{label_b}",
+            }
+        )
+    )
+
+    assignments.to_csv(
+        f"{prefix}_particle_assignments.csv",
+        index=False,
+    )
+
+    # Save particles present only in one classification.
+
+    if n_only_a > 0:
+        (
+            data_a[
+                data_a[
+                    "rlnTomoParticleName"
+                ].isin(only_a)
+            ]
+            .to_csv(
+                f"{prefix}_only_{label_a}.csv",
+                index=False,
+            )
+        )
+
+    if n_only_b > 0:
+        (
+            data_b[
+                data_b[
+                    "rlnTomoParticleName"
+                ].isin(only_b)
+            ]
+            .to_csv(
+                f"{prefix}_only_{label_b}.csv",
+                index=False,
+            )
+        )
+
+    print(
+        f"Results saved to: "
+        f"{output_dir.resolve()}/"
+    )
+
+    print()
+
+
+if __name__ == "__main__":
+    main()

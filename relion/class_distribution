@@ -1,0 +1,516 @@
+#!/apps/strubi/software/packages/miniforge3/envs/miss-alignment/bin/python
+
+"""
+class_distribution
+
+Track class population changes across iterations of a RELION Class3D job.
+
+The script reads all run_it*_model.star files in a RELION Class3D job
+directory and extracts _rlnClassDistribution for each class and iteration.
+
+It reports class percentages in the terminal and generates:
+
+    class_distribution_long.csv
+        Long-format table containing class distribution and additional
+        RELION model statistics for each class and iteration.
+
+    class_distribution_wide.csv
+        Wide-format table containing class distributions by iteration.
+
+    class_distribution.png
+        Plot showing class distribution (%) as a function of iteration.
+
+Usage:
+    class_distribution JOB_DIR
+
+Examples:
+    class_distribution Class3D/job047
+    class_distribution Class3D/job001
+
+Note:
+    Class numbers are tracked according to their RELION class indices.
+    A class index should not necessarily be interpreted as a persistent
+    biological class identity across all iterations, because class
+    references evolve during optimization.
+
+Developed and maintained by Long Chen.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import re
+import shlex
+from collections import defaultdict
+from pathlib import Path
+
+
+def parse_class_loop(star_path: Path) -> list[dict[str, str]]:
+    """
+    Read the STAR loop containing RELION class model information.
+
+    The target loop must contain at least:
+        _rlnReferenceImage
+        _rlnClassDistribution
+    """
+
+    lines = star_path.read_text(errors="replace").splitlines()
+    index = 0
+
+    while index < len(lines):
+        if lines[index].strip() != "loop_":
+            index += 1
+            continue
+
+        index += 1
+        headers: list[str] = []
+
+        while index < len(lines):
+            line = lines[index].strip()
+
+            if not line:
+                index += 1
+                continue
+
+            if line.startswith("_"):
+                headers.append(line.split()[0])
+                index += 1
+                continue
+
+            break
+
+        required_headers = {
+            "_rlnReferenceImage",
+            "_rlnClassDistribution",
+        }
+
+        if not required_headers.issubset(headers):
+            continue
+
+        rows: list[dict[str, str]] = []
+
+        while index < len(lines):
+            line = lines[index].strip()
+
+            if not line:
+                if rows:
+                    break
+
+                index += 1
+                continue
+
+            if (
+                line == "loop_"
+                or line.startswith("data_")
+                or line.startswith("_")
+            ):
+                break
+
+            values = shlex.split(line)
+
+            if len(values) >= len(headers):
+                rows.append(
+                    dict(zip(headers, values[: len(headers)]))
+                )
+
+            index += 1
+
+        if rows:
+            return rows
+
+    raise RuntimeError(
+        f"Could not find the class model loop in {star_path}"
+    )
+
+
+def optional_float(
+    row: dict[str, str],
+    key: str,
+) -> float | None:
+    """Return a STAR value as float, or None if absent or invalid."""
+
+    value = row.get(key)
+
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+
+    except ValueError:
+        return None
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Track class population changes across iterations of a "
+            "RELION Class3D job."
+        )
+    )
+
+    parser.add_argument(
+        "job_dir",
+        help=(
+            "RELION Class3D job directory, for example "
+            "Class3D/job047."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    job_dir = Path(args.job_dir)
+
+    if not job_dir.exists():
+        raise FileNotFoundError(
+            f"RELION Class3D job directory does not exist: {job_dir}"
+        )
+
+    if not job_dir.is_dir():
+        raise NotADirectoryError(
+            f"Expected a directory but received: {job_dir}"
+        )
+
+    iteration_pattern = re.compile(
+        r"run_it(\d+)_model\.star$"
+    )
+
+    class_pattern = re.compile(
+        r"class(\d+)\.mrc$"
+    )
+
+    model_files = []
+
+    for path in job_dir.glob("run_it*_model.star"):
+        match = iteration_pattern.search(path.name)
+
+        if match is not None:
+            model_files.append(path)
+
+    model_files.sort(
+        key=lambda path: int(
+            iteration_pattern.search(path.name).group(1)
+        )
+    )
+
+    if not model_files:
+        raise FileNotFoundError(
+            f"No run_it*_model.star files found in {job_dir}"
+        )
+
+    long_rows: list[dict[str, object]] = []
+
+    for model_file in model_files:
+        iteration_match = iteration_pattern.search(
+            model_file.name
+        )
+
+        if iteration_match is None:
+            continue
+
+        iteration = int(iteration_match.group(1))
+
+        class_rows = parse_class_loop(model_file)
+
+        for row in class_rows:
+            reference_image = row["_rlnReferenceImage"]
+
+            class_match = class_pattern.search(
+                reference_image
+            )
+
+            if class_match is None:
+                continue
+
+            class_number = int(
+                class_match.group(1)
+            )
+
+            distribution = float(
+                row["_rlnClassDistribution"]
+            )
+
+            long_rows.append(
+                {
+                    "iteration": iteration,
+                    "class_number": class_number,
+                    "class_name": (
+                        f"class{class_number:03d}"
+                    ),
+                    "distribution": distribution,
+                    "percentage": (
+                        distribution * 100.0
+                    ),
+                    "accuracy_rotations": optional_float(
+                        row,
+                        "_rlnAccuracyRotations",
+                    ),
+                    "accuracy_translations_angstrom":
+                        optional_float(
+                            row,
+                            "_rlnAccuracyTranslationsAngst",
+                        ),
+                    "estimated_resolution_angstrom":
+                        optional_float(
+                            row,
+                            "_rlnEstimatedResolution",
+                        ),
+                    "overall_fourier_completeness":
+                        optional_float(
+                            row,
+                            "_rlnOverallFourierCompleteness",
+                        ),
+                    "reference_image": reference_image,
+                    "model_star": str(model_file),
+                }
+            )
+
+    if not long_rows:
+        raise RuntimeError(
+            "No class distribution entries could be extracted "
+            f"from the model STAR files in {job_dir}"
+        )
+
+    long_rows.sort(
+        key=lambda row: (
+            int(row["iteration"]),
+            int(row["class_number"]),
+        )
+    )
+
+    # ------------------------------------------------------------
+    # Long-format CSV
+    # ------------------------------------------------------------
+
+    long_output = (
+        job_dir / "class_distribution_long.csv"
+    )
+
+    with long_output.open(
+        "w",
+        newline="",
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=list(
+                long_rows[0].keys()
+            ),
+        )
+
+        writer.writeheader()
+        writer.writerows(long_rows)
+
+    # ------------------------------------------------------------
+    # Organize class distributions by iteration
+    # ------------------------------------------------------------
+
+    all_classes = sorted(
+        {
+            int(row["class_number"])
+            for row in long_rows
+        }
+    )
+
+    by_iteration: dict[
+        int,
+        dict[int, float],
+    ] = defaultdict(dict)
+
+    for row in long_rows:
+        by_iteration[
+            int(row["iteration"])
+        ][
+            int(row["class_number"])
+        ] = float(
+            row["distribution"]
+        )
+
+    # ------------------------------------------------------------
+    # Wide-format CSV
+    # ------------------------------------------------------------
+
+    wide_output = (
+        job_dir / "class_distribution_wide.csv"
+    )
+
+    wide_headers = [
+        "iteration",
+        *[
+            f"class{number:03d}"
+            for number in all_classes
+        ],
+        "sum",
+    ]
+
+    with wide_output.open(
+        "w",
+        newline="",
+    ) as handle:
+        writer = csv.writer(handle)
+
+        writer.writerow(wide_headers)
+
+        for iteration in sorted(by_iteration):
+            values = [
+                by_iteration[
+                    iteration
+                ].get(
+                    class_number,
+                    float("nan"),
+                )
+                for class_number in all_classes
+            ]
+
+            total = sum(
+                value
+                for value in values
+                if value == value
+            )
+
+            writer.writerow(
+                [
+                    iteration,
+                    *values,
+                    total,
+                ]
+            )
+
+    # ------------------------------------------------------------
+    # Terminal summary
+    # ------------------------------------------------------------
+
+    print(
+        f"{'Iteration':>9} "
+        + " ".join(
+            f"{f'Class {number}':>12}"
+            for number in all_classes
+        )
+        + f" {'Sum':>10}"
+    )
+
+    for iteration in sorted(by_iteration):
+        distributions = [
+            by_iteration[
+                iteration
+            ].get(
+                class_number,
+                float("nan"),
+            )
+            for class_number in all_classes
+        ]
+
+        percentages = [
+            (
+                value * 100.0
+                if value == value
+                else float("nan")
+            )
+            for value in distributions
+        ]
+
+        total = sum(
+            value
+            for value in distributions
+            if value == value
+        )
+
+        print(
+            f"{iteration:9d} "
+            + " ".join(
+                f"{percentage:11.2f}%"
+                for percentage in percentages
+            )
+            + f" {total:10.6f}"
+        )
+
+    print(
+        f"\nLong-format CSV: {long_output}"
+    )
+
+    print(
+        f"Wide-format CSV: {wide_output}"
+    )
+
+    # ------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------
+
+    try:
+        import matplotlib.pyplot as plt
+
+    except ImportError:
+        print(
+            "Matplotlib is not available; "
+            "CSV files were still created."
+        )
+        return
+
+    for class_number in all_classes:
+        iterations = []
+        percentages = []
+
+        for iteration in sorted(by_iteration):
+            value = by_iteration[
+                iteration
+            ].get(class_number)
+
+            if value is not None:
+                iterations.append(
+                    iteration
+                )
+
+                percentages.append(
+                    value * 100.0
+                )
+
+        plt.plot(
+            iterations,
+            percentages,
+            marker="o",
+            label=f"Class {class_number}",
+        )
+
+    plt.xlabel("Iteration")
+    plt.ylabel("Class distribution (%)")
+
+    plt.title(
+        "RELION 3D classification: "
+        "class distribution"
+    )
+
+    plt.xticks(
+        sorted(by_iteration)
+    )
+
+    plt.ylim(
+        0,
+        100,
+    )
+
+    plt.grid(
+        True,
+        alpha=0.3,
+    )
+
+    plt.legend()
+    plt.tight_layout()
+
+    plot_output = (
+        job_dir / "class_distribution.png"
+    )
+
+    plt.savefig(
+        plot_output,
+        dpi=200,
+    )
+
+    plt.close()
+
+    print(
+        f"Plot: {plot_output}"
+    )
+
+
+if __name__ == "__main__":
+    main()

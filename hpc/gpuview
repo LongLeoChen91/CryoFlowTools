@@ -1,0 +1,498 @@
+#!/apps/strubi/software/packages/miniforge3/envs/miss-alignment/bin/python
+
+"""
+gpuview
+
+Display a summarized view of GPU nodes and running jobs in a Slurm
+partition.
+
+The script queries Slurm using sinfo, scontrol, and squeue, and reports
+for each node:
+
+    - node state
+    - CPU allocation and load
+    - memory allocation
+    - GPU model
+    - total, allocated, and free GPUs
+    - jobs currently assigned to the node
+
+"Free GPUs" refers to GPUs that are not allocated by Slurm. It does not
+represent real-time GPU utilization as reported by nvidia-smi.
+
+Usage:
+    gpuview
+    gpuview PARTITION
+    gpuview PARTITION --debug
+
+Examples:
+    gpuview
+    gpuview gpu_interactive
+    gpuview gpu_strubi
+    gpuview gpu_strubi --debug
+
+If PARTITION is omitted, gpu_interactive is used.
+
+This command should be run on a login node where Slurm commands
+(sinfo, scontrol, and squeue) are available.
+
+Adapted from a script by Pranav Shah.
+Maintained by Long Chen.
+"""
+
+import argparse
+import shlex
+import subprocess
+from collections import defaultdict
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+
+# Global console for formatted terminal output
+console = Console()
+
+
+SINFO_NODES_CMD = 'sinfo -p {partition} -N -h -o "%N"'
+SCONTROL_NODE_CMD = "scontrol show node -d {nodelist}"
+
+# Query by nodelist (-w) instead of partition (-p) so that jobs running
+# on the actual nodes are reported even if nodes belong to multiple partitions.
+SQUEUE_CMD = 'squeue -w {nodelist} --noheader -o "%.20j|%u|%i|%t|%N"'
+
+
+def run_command(command_str: str) -> str:
+    """
+    Run a shell command and return its stdout.
+
+    Exit with an error message if the command fails or cannot be found.
+    """
+    try:
+        return subprocess.check_output(
+            shlex.split(command_str),
+            text=True,
+        )
+
+    except (subprocess.CalledProcessError, FileNotFoundError) as error:
+        console.print(
+            f"[bold red]Error running command:[/bold red] {command_str}"
+        )
+        console.print(error)
+        raise SystemExit(1)
+
+
+def parse_tres(tres_string: str, debug: bool = False) -> dict:
+    """
+    Parse GPU allocation information from a Slurm TRES string.
+
+    Returns a dictionary containing the GPU count. If no GPU entry is
+    present, the GPU count defaults to zero.
+    """
+    tres_data = defaultdict(lambda: "0")
+
+    if not tres_string or tres_string == "(null)":
+        return tres_data
+
+    if debug:
+        console.print(f"[dim]Parsing TRES: {tres_string}[/dim]")
+
+    parts = tres_string.split(",")
+
+    for part in parts:
+        if "gres/gpu" in part and "=" in part:
+            gpu_count = part.split("=")[-1].strip()
+            tres_data["gpu"] = gpu_count
+
+            if debug:
+                console.print(
+                    f"[dim]Found GPU count: {gpu_count}[/dim]"
+                )
+
+            break
+
+    return tres_data
+
+
+def get_node_data(partition: str, debug: bool = False) -> dict:
+    """
+    Get node resource information for a Slurm partition.
+
+    Node names are obtained with sinfo. Detailed CPU, memory, GPU,
+    and state information is then retrieved using scontrol.
+    """
+    nodelist_str = run_command(
+        SINFO_NODES_CMD.format(partition=partition)
+    ).strip()
+
+    if not nodelist_str:
+        return {}
+
+    nodelist_csv = ",".join(nodelist_str.splitlines())
+
+    scontrol_output = run_command(
+        SCONTROL_NODE_CMD.format(nodelist=nodelist_csv)
+    )
+
+    nodes = {}
+
+    for node_block in scontrol_output.strip().split("\n\n"):
+        node_info = {}
+
+        for line in node_block.split("\n"):
+            line = line.strip()
+
+            if line.startswith("NodeName="):
+                node_info["NodeName"] = (
+                    line.split()[0].split("=")[1]
+                )
+
+            if "State=" in line:
+                for part in line.split():
+                    if part.startswith("State="):
+                        node_info["State"] = part.split("=")[1]
+
+            if "CPULoad=" in line:
+                for part in line.split():
+                    if part.startswith("CPULoad="):
+                        node_info["CPULoad"] = part.split("=")[1]
+
+            if "CPUAlloc=" in line:
+                for part in line.split():
+                    if part.startswith("CPUAlloc="):
+                        node_info["CPUAlloc"] = part.split("=")[1]
+
+            if "CPUTot=" in line:
+                for part in line.split():
+                    if part.startswith("CPUTot="):
+                        node_info["CPUTot"] = part.split("=")[1]
+
+            if "RealMemory=" in line:
+                for part in line.split():
+                    if part.startswith("RealMemory="):
+                        node_info["RealMemory"] = part.split("=")[1]
+
+            if "AllocMem=" in line:
+                for part in line.split():
+                    if part.startswith("AllocMem="):
+                        node_info["AllocMem"] = part.split("=")[1]
+
+            if "CfgTRES=" in line:
+                idx = line.index("CfgTRES=")
+                node_info["CfgTRES"] = line[idx + 8:].strip()
+
+            if "AllocTRES=" in line:
+                idx = line.index("AllocTRES=")
+                node_info["AllocTRES"] = line[idx + 10:].strip()
+
+        node_name = node_info.get("NodeName", "").split(".")[0]
+
+        if not node_name:
+            continue
+
+        if debug:
+            console.print(
+                f"[dim]Debug {node_name}: "
+                f"CfgTRES={node_info.get('CfgTRES', 'NOT FOUND')}[/dim]"
+            )
+            console.print(
+                f"[dim]Debug {node_name}: "
+                f"AllocTRES={node_info.get('AllocTRES', 'NOT FOUND')}[/dim]"
+            )
+
+        cfg_tres = parse_tres(
+            node_info.get("CfgTRES", ""),
+            debug,
+        )
+
+        alloc_tres = parse_tres(
+            node_info.get("AllocTRES", ""),
+            debug,
+        )
+
+        total_gpus = int(cfg_tres["gpu"])
+        alloc_gpus = int(alloc_tres["gpu"])
+
+        # Parse the GPU model from the Slurm Gres field.
+        # Example:
+        #     Gres=gpu:a100:4
+        node_info["GpuModel"] = ""
+
+        if "Gres=" in node_block:
+            for line in node_block.split("\n"):
+                if "Gres=" not in line:
+                    continue
+
+                for part in line.strip().split():
+                    if part.startswith("Gres=gpu:"):
+                        try:
+                            node_info["GpuModel"] = part.split(":")[1]
+                        except IndexError:
+                            pass
+
+                break
+
+        nodes[node_name] = {
+            "gpu_model": node_info.get("GpuModel", ""),
+            "state": node_info.get(
+                "State",
+                "UNKNOWN",
+            ).replace("+DRAIN", ""),
+            "cpus_load": node_info.get("CPULoad", "N/A"),
+            "cpus_alloc": node_info.get("CPUAlloc", "0"),
+            "cpus_total": node_info.get("CPUTot", "0"),
+            "mem_alloc": int(node_info.get("AllocMem", "0")),
+            "mem_total": int(node_info.get("RealMemory", "0")),
+            "gpus": {
+                "total": total_gpus,
+                "used": alloc_gpus,
+                "free": total_gpus - alloc_gpus,
+            },
+        }
+
+    return nodes
+
+
+def parse_squeue(output: str) -> dict:
+    """
+    Parse squeue output and group jobs by node.
+
+    Node names are normalized by removing domain suffixes.
+    """
+    jobs_by_node = defaultdict(list)
+
+    for line in output.strip().splitlines():
+        try:
+            job_name, user, job_id, state, nodelist = (
+                line.strip().split("|")
+            )
+
+            job_info = {
+                "name": job_name.strip(),
+                "user": user,
+                "id": job_id,
+                "state": state,
+            }
+
+            nodes = nodelist.split(",")
+
+            for node in nodes:
+                norm_node = node.split(".")[0]
+                jobs_by_node[norm_node].append(job_info)
+
+        except ValueError:
+            continue
+
+    return jobs_by_node
+
+
+def main() -> None:
+    """Parse command-line arguments and display the Slurm partition view."""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Display Slurm node resources, free GPU allocations, "
+            "and running jobs for a partition."
+        )
+    )
+
+    parser.add_argument(
+        "partition",
+        nargs="?",
+        default="gpu_interactive",
+        help=(
+            "Slurm partition to query "
+            "(default: gpu_interactive)."
+        ),
+    )
+
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Enable debug output.",
+    )
+
+    args = parser.parse_args()
+
+    squeue_output = ""
+
+    with console.status(
+        f"[bold green]Fetching data for partition "
+        f"'{args.partition}'..."
+    ):
+        nodes_data = get_node_data(
+            args.partition,
+            args.debug,
+        )
+
+        if nodes_data:
+            nodelist_for_squeue = ",".join(nodes_data.keys())
+
+            squeue_output = run_command(
+                SQUEUE_CMD.format(
+                    nodelist=nodelist_for_squeue
+                )
+            )
+
+    jobs_by_node = parse_squeue(squeue_output)
+
+    if not nodes_data:
+        console.print(
+            f"[bold red]No nodes found in partition "
+            f"'{args.partition}'.[/bold red]"
+        )
+        raise SystemExit(0)
+
+    console.print(
+        f"\n[bold underline]"
+        f"Partition Status: {args.partition}"
+        f"[/bold underline]\n"
+    )
+
+    # Sort nodes by number of free GPUs, from lowest to highest.
+    for node_name in sorted(
+        nodes_data.keys(),
+        key=lambda name: nodes_data[name]["gpus"]["free"],
+    ):
+        node = nodes_data[node_name]
+
+        state = node["state"].upper()
+
+        state_color = (
+            "green"
+            if "IDLE" in state
+            else "yellow"
+            if "MIX" in state
+            else "red"
+        )
+
+        gpu_info = node.get("gpus", {})
+        gpu_model = node.get("gpu_model")
+        gpu_text = ""
+
+        if gpu_info.get("total", 0) > 0:
+            free = gpu_info["free"]
+            total = gpu_info["total"]
+
+            if free == total:
+                gpu_color = "green"
+            elif free > 0:
+                gpu_color = "yellow"
+            else:
+                gpu_color = "red"
+
+            model_text = (
+                f"({gpu_model}) "
+                if gpu_model
+                else ""
+            )
+
+            gpu_text = (
+                f"| GPUs {model_text}"
+                f"Free: [{gpu_color}]"
+                f"{free}/{total}"
+                f"[/{gpu_color}] "
+            )
+
+        if args.debug:
+            console.print(
+                f"[dim]Debug {node_name} "
+                f"GPU info: {gpu_info}[/dim]"
+            )
+
+        panel_content = (
+            f"CPUs: "
+            f"{node['cpus_alloc']}/{node['cpus_total']} "
+            f"(Load: {node['cpus_load']}) | "
+            f"Mem: "
+            f"{node['mem_alloc'] // 1024}/"
+            f"{node['mem_total'] // 1024} GB "
+            f"{gpu_text}"
+        )
+
+        node_panel = Panel(
+            Text.from_markup(
+                panel_content,
+                justify="left",
+            ),
+            title=(
+                f"[bold]{node_name}[/bold] "
+                f"([{state_color}]"
+                f"{state}"
+                f"[/{state_color}])"
+            ),
+            border_style="bright_cyan",
+            expand=False,
+        )
+
+        console.print(node_panel)
+
+        node_jobs = jobs_by_node.get(node_name)
+
+        if node_jobs:
+            job_table = Table(
+                box=None,
+                show_header=True,
+                header_style="bold cyan",
+            )
+
+            job_table.add_column(
+                "Job ID",
+                width=12,
+            )
+
+            job_table.add_column(
+                "Job Name",
+                width=22,
+            )
+
+            job_table.add_column(
+                "User",
+                width=15,
+            )
+
+            job_table.add_column(
+                "State",
+                width=7,
+            )
+
+            for job in node_jobs:
+                state_color = (
+                    "green"
+                    if job["state"] == "R"
+                    else "yellow"
+                )
+
+                job_table.add_row(
+                    job["id"],
+                    job["name"],
+                    job["user"],
+                    (
+                        f"[{state_color}]"
+                        f"{job['state']}"
+                        f"[/{state_color}]"
+                    ),
+                )
+
+            console.print(job_table)
+
+        else:
+            console.print(
+                Text(
+                    "  -> No jobs running.",
+                    style="italic dim",
+                )
+            )
+
+        console.print()
+
+    console.print(
+        f"\n[bold underline]"
+        f"Partition Status: {args.partition}"
+        f"[/bold underline]\n"
+    )
+
+
+if __name__ == "__main__":
+    main()
