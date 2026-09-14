@@ -65,6 +65,13 @@ relion/split_star_by_tomo run_data.star
 relion/split_star_by_tomo run_data.star -o by_tomo
 ```
 
+To also strip the `.tomostar` suffix from `rlnTomoName` values in the
+output files (useful for ArtiaX):
+
+```bash
+relion/split_star_by_tomo run_data.star --strip-tomostar-suffix
+```
+
 ### missali_report
 
 Summarise MissAlignment alignment-loss results:

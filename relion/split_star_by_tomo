@@ -6,7 +6,8 @@ split_star_by_tomo
 Split a RELION STAR file into one STAR file per tomogram using rlnTomoName.
 
 Other STAR blocks, such as data_optics, are preserved in every output
-file. The original rlnTomoName values are not modified.
+file. The original rlnTomoName values are not modified unless
+--strip-tomostar-suffix is used.
 
 A summary CSV is also written, sorted by particle count from largest
 to smallest.
@@ -17,6 +18,8 @@ Usage:
     split_star_by_tomo INPUT.star -o by_tomo
 
     split_star_by_tomo INPUT.star -o by_tomo --overwrite
+
+    split_star_by_tomo INPUT.star --strip-tomostar-suffix
 
 Example:
     split_star_by_tomo run_data.star
@@ -232,11 +235,28 @@ def build_output_names(
     return output_names
 
 
+def strip_tomostar(value: str) -> str:
+    """
+    Remove a trailing .tomostar suffix from an rlnTomoName value.
+
+    Example:
+        FV3h24_1003010004.tomostar -> FV3h24_1003010004
+    """
+
+    return re.sub(
+        r"\.tomostar$",
+        "",
+        str(value),
+        flags=re.IGNORECASE,
+    )
+
+
 def split_star_by_tomo(
     input_star: Path,
     output_dir: Path,
     block_name: str | None = None,
     overwrite: bool = False,
+    strip_tomostar_suffix: bool = False,
 ) -> None:
     """
     Split a STAR file into one STAR file per rlnTomoName.
@@ -331,11 +351,20 @@ def split_star_by_tomo(
 
         for name, data in blocks.items():
             if name == particle_block_name:
-                output_blocks[name] = (
+                out_sub = (
                     sub_df
                     .reset_index(drop=True)
                     .copy()
                 )
+
+                if strip_tomostar_suffix:
+                    out_sub[tomo_column] = (
+                        out_sub[tomo_column]
+                        .astype(str)
+                        .map(strip_tomostar)
+                    )
+
+                output_blocks[name] = out_sub
 
             elif isinstance(data, pd.DataFrame):
                 output_blocks[name] = data.copy()
@@ -457,6 +486,16 @@ def parse_args() -> argparse.Namespace:
         help="Overwrite existing output STAR files.",
     )
 
+    parser.add_argument(
+        "--strip-tomostar-suffix",
+        action="store_true",
+        help=(
+            "Remove trailing .tomostar suffix from "
+            "rlnTomoName values in the output STAR files. "
+            "The input file is not modified."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -468,6 +507,7 @@ def main() -> None:
         output_dir=args.output,
         block_name=args.block,
         overwrite=args.overwrite,
+        strip_tomostar_suffix=args.strip_tomostar_suffix,
     )
 
 
