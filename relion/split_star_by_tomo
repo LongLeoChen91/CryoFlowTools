@@ -1,0 +1,475 @@
+#!/apps/strubi/software/packages/miniforge3/envs/miss-alignment/bin/python
+
+"""
+split_star_by_tomo
+
+Split a RELION STAR file into one STAR file per tomogram using rlnTomoName.
+
+Other STAR blocks, such as data_optics, are preserved in every output
+file. The original rlnTomoName values are not modified.
+
+A summary CSV is also written, sorted by particle count from largest
+to smallest.
+
+Usage:
+    split_star_by_tomo INPUT.star
+
+    split_star_by_tomo INPUT.star -o by_tomo
+
+    split_star_by_tomo INPUT.star -o by_tomo --overwrite
+
+Example:
+    split_star_by_tomo run_data.star
+
+Developed and maintained by Long Chen.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+
+import pandas as pd
+import starfile
+
+
+def find_tomo_column(df: pd.DataFrame) -> str | None:
+    """
+    Find rlnTomoName, allowing an optional leading underscore.
+    """
+
+    for column in df.columns:
+        normalized = str(column).lstrip("_").lower()
+
+        if normalized == "rlntomoname":
+            return str(column)
+
+    return None
+
+
+def find_tomo_block(
+    blocks: dict,
+    requested_block: str | None = None,
+) -> tuple[str, pd.DataFrame, str]:
+    """
+    Find the STAR block containing rlnTomoName.
+    """
+
+    if requested_block is not None:
+        if requested_block not in blocks:
+            available = ", ".join(blocks.keys())
+
+            raise KeyError(
+                f"STAR block '{requested_block}' was not found.\n"
+                f"Available blocks: {available}"
+            )
+
+        df = blocks[requested_block]
+
+        if not isinstance(df, pd.DataFrame):
+            raise RuntimeError(
+                f"STAR block '{requested_block}' is not a table."
+            )
+
+        tomo_column = find_tomo_column(df)
+
+        if tomo_column is None:
+            raise RuntimeError(
+                f"STAR block '{requested_block}' does not contain "
+                "rlnTomoName."
+            )
+
+        return requested_block, df, tomo_column
+
+    candidates = []
+
+    for block_name, block_data in blocks.items():
+        if not isinstance(block_data, pd.DataFrame):
+            continue
+
+        tomo_column = find_tomo_column(block_data)
+
+        if tomo_column is not None:
+            candidates.append(
+                (
+                    block_name,
+                    block_data,
+                    tomo_column,
+                )
+            )
+
+    if not candidates:
+        available = ", ".join(blocks.keys())
+
+        raise RuntimeError(
+            "Could not find rlnTomoName in any STAR block.\n"
+            f"Available blocks: {available}"
+        )
+
+    if len(candidates) > 1:
+        names = ", ".join(
+            block_name
+            for block_name, _, _ in candidates
+        )
+
+        raise RuntimeError(
+            "rlnTomoName was found in more than one STAR block: "
+            f"{names}\n"
+            "Use --block BLOCK_NAME to specify which block to split."
+        )
+
+    return candidates[0]
+
+
+def sanitize_tomo_filename(tomo_name: str) -> str:
+    """
+    Convert rlnTomoName into a safe output filename.
+
+    The STAR metadata itself is not modified.
+
+    Example:
+        FV3h24_1001010002.tomostar
+            -> FV3h24_1001010002.star
+    """
+
+    value = str(tomo_name).strip()
+
+    # Remove any directory component.
+    value = re.split(r"[\\/]", value)[-1]
+
+    # Remove .tomostar from output filename only.
+    value = re.sub(
+        r"\.tomostar$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    # Replace inconvenient filename characters.
+    value = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        value,
+    )
+
+    value = value.strip("._")
+
+    if not value:
+        raise ValueError(
+            f"Could not generate a valid filename from "
+            f"rlnTomoName: {tomo_name!r}"
+        )
+
+    return value
+
+
+def validate_tomo_names(
+    df: pd.DataFrame,
+    tomo_column: str,
+) -> None:
+    """
+    Ensure all particles have valid rlnTomoName values.
+    """
+
+    missing = df[tomo_column].isna()
+
+    if missing.any():
+        count = int(missing.sum())
+
+        raise RuntimeError(
+            f"{count} rows have missing values in "
+            f"{tomo_column}."
+        )
+
+    empty = (
+        df[tomo_column]
+        .astype(str)
+        .str.strip()
+        .eq("")
+    )
+
+    if empty.any():
+        count = int(empty.sum())
+
+        raise RuntimeError(
+            f"{count} rows have empty values in "
+            f"{tomo_column}."
+        )
+
+
+def build_output_names(
+    tomo_names: list[str],
+) -> dict[str, str]:
+    """
+    Generate output filenames and detect naming collisions.
+    """
+
+    output_names: dict[str, str] = {}
+    reverse_lookup: dict[str, str] = {}
+
+    for tomo_name in tomo_names:
+        safe_name = sanitize_tomo_filename(
+            tomo_name
+        )
+
+        filename = f"{safe_name}.star"
+
+        if filename in reverse_lookup:
+            previous = reverse_lookup[filename]
+
+            if previous != tomo_name:
+                raise RuntimeError(
+                    "Two different rlnTomoName values would "
+                    f"produce the same filename '{filename}':\n"
+                    f"  {previous}\n"
+                    f"  {tomo_name}"
+                )
+
+        output_names[tomo_name] = filename
+        reverse_lookup[filename] = tomo_name
+
+    return output_names
+
+
+def split_star_by_tomo(
+    input_star: Path,
+    output_dir: Path,
+    block_name: str | None = None,
+    overwrite: bool = False,
+) -> None:
+    """
+    Split a STAR file into one STAR file per rlnTomoName.
+    """
+
+    if not input_star.exists():
+        raise FileNotFoundError(
+            f"Input STAR file does not exist: {input_star}"
+        )
+
+    if not input_star.is_file():
+        raise RuntimeError(
+            f"Expected a STAR file but received: {input_star}"
+        )
+
+    print()
+    print(f"Input STAR: {input_star}")
+    print("Reading STAR file...")
+
+    blocks = starfile.read(
+        input_star,
+        always_dict=True,
+    )
+
+    (
+        particle_block_name,
+        particle_df,
+        tomo_column,
+    ) = find_tomo_block(
+        blocks,
+        requested_block=block_name,
+    )
+
+    validate_tomo_names(
+        particle_df,
+        tomo_column,
+    )
+
+    print(f"Particle block: {particle_block_name}")
+    print(f"Tomogram column: {tomo_column}")
+    print(f"Particles: {len(particle_df)}")
+
+    unique_tomos = (
+        particle_df[tomo_column]
+        .astype(str)
+        .drop_duplicates()
+        .tolist()
+    )
+
+    output_names = build_output_names(
+        unique_tomos
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print(f"Tomograms: {len(unique_tomos)}")
+    print(f"Output directory: {output_dir}")
+    print()
+
+    report = []
+
+    grouped = particle_df.groupby(
+        tomo_column,
+        sort=True,
+        dropna=False,
+    )
+
+    for tomo_name, sub_df in grouped:
+        tomo_name = str(tomo_name)
+
+        output_filename = output_names[
+            tomo_name
+        ]
+
+        output_path = (
+            output_dir
+            / output_filename
+        )
+
+        if output_path.exists() and not overwrite:
+            raise FileExistsError(
+                f"Output file already exists: {output_path}\n"
+                "Use --overwrite to replace existing files."
+            )
+
+        # Preserve all original STAR blocks.
+        # Only replace the particle block with this tomogram subset.
+        output_blocks = {}
+
+        for name, data in blocks.items():
+            if name == particle_block_name:
+                output_blocks[name] = (
+                    sub_df
+                    .reset_index(drop=True)
+                    .copy()
+                )
+
+            elif isinstance(data, pd.DataFrame):
+                output_blocks[name] = data.copy()
+
+            else:
+                output_blocks[name] = data
+
+        starfile.write(
+            output_blocks,
+            output_path,
+            overwrite=overwrite,
+        )
+
+        particle_count = len(sub_df)
+
+        report.append(
+            {
+                "rlnTomoName": tomo_name,
+                "particles": particle_count,
+                "star_file": output_filename,
+            }
+        )
+
+    # ------------------------------------------------------------
+    # Create summary table
+    # ------------------------------------------------------------
+
+    report_df = pd.DataFrame(report)
+
+    report_df = report_df.sort_values(
+        by="particles",
+        ascending=False,
+    ).reset_index(drop=True)
+
+    summary_path = (
+        output_dir
+        / "tomogram_particle_counts.csv"
+    )
+
+    report_df.to_csv(
+        summary_path,
+        index=False,
+    )
+
+    # ------------------------------------------------------------
+    # Print sorted particle counts
+    # ------------------------------------------------------------
+
+    print("=" * 72)
+    print("Particle counts by tomogram")
+    print("=" * 72)
+
+    print(
+        f"{'Tomogram':<50}"
+        f"{'Particles':>10}"
+    )
+
+    print("-" * 72)
+
+    for row in report_df.itertuples(
+        index=False
+    ):
+        print(
+            f"{row.rlnTomoName:<50}"
+            f"{row.particles:>10}"
+        )
+
+    print("-" * 72)
+
+    total_particles = int(
+        report_df["particles"].sum()
+    )
+
+    print()
+    print(f"Tomograms:    {len(report_df)}")
+    print(f"Particles:    {total_particles}")
+    print(f"Output:       {output_dir.resolve()}")
+    print(f"Summary CSV:  {summary_path.resolve()}")
+    print()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Split a RELION STAR file into one STAR file per "
+            "rlnTomoName while preserving other STAR blocks."
+        )
+    )
+
+    parser.add_argument(
+        "input_star",
+        type=Path,
+        help="Input RELION STAR file.",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=Path("by_tomo"),
+        help=(
+            "Output directory "
+            "(default: by_tomo)."
+        ),
+    )
+
+    parser.add_argument(
+        "--block",
+        default=None,
+        help=(
+            "Explicit STAR block containing rlnTomoName. "
+            "Normally auto-detected."
+        ),
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output STAR files.",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    split_star_by_tomo(
+        input_star=args.input_star,
+        output_dir=args.output,
+        block_name=args.block,
+        overwrite=args.overwrite,
+    )
+
+
+if __name__ == "__main__":
+    main()
