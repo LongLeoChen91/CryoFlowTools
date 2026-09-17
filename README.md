@@ -11,6 +11,7 @@ workflows on HPC clusters.
 | `class_distribution` | `relion/` | Tracks RELION Class3D class distributions across iterations |
 | `compare_class3d_jobs` | `relion/` | Compares particle class assignments between two RELION Class3D `*_data.star` files |
 | `split_star_by_tomo` | `relion/` | Splits a RELION STAR file into one file per `rlnTomoName` or `rlnMicrographName` |
+| `merge_star_files` | `relion/` | Merges compatible RELION STAR files while preserving particle metadata and other blocks |
 | `missali_report` | `missalignment/` | Summarises MissAlignment `*_alignment_loss.json` results |
 
 ## Installation
@@ -24,7 +25,7 @@ pip install -r requirements.txt
 The scripts are standalone executables. Make them executable if needed:
 
 ```bash
-chmod +x hpc/gpuview relion/class_distribution relion/compare_class3d_jobs relion/split_star_by_tomo missalignment/missali_report
+chmod +x hpc/gpuview relion/class_distribution relion/compare_class3d_jobs relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report
 ```
 
 ## Usage
@@ -79,6 +80,25 @@ files (useful for ArtiaX):
 ```bash
 relion/split_star_by_tomo run_data.star --strip-tomostar-suffix
 ```
+
+### merge_star_files
+
+Merge compatible STAR files (e.g. those produced by `split_star_by_tomo`)
+back into a single file. Non-particle blocks such as `data_optics` are
+preserved when they are identical across all inputs:
+
+```bash
+relion/merge_star_files \
+    --input \
+    by_tomo/L3_pos01_ts_004.star \
+    by_tomo/L3_pos01_ts_007.star \
+    by_tomo/L3_pos01_ts_006.star \
+    --output merged_L3.star
+```
+
+Options: `--input` (two or more STAR files), `-o / --output` (output
+path), `--block` (explicit particle block name), `--overwrite` (replace
+existing output).
 
 ### missali_report
 
