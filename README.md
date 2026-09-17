@@ -10,7 +10,7 @@ workflows on HPC clusters.
 | `gpuview` | `hpc/` | Summarises Slurm GPU-node resources and running jobs |
 | `class_distribution` | `relion/` | Tracks RELION Class3D class distributions across iterations |
 | `compare_class3d_jobs` | `relion/` | Compares particle class assignments between two RELION Class3D `*_data.star` files |
-| `split_star_by_tomo` | `relion/` | Splits a RELION STAR file into one file per tomogram (`rlnTomoName`) |
+| `split_star_by_tomo` | `relion/` | Splits a RELION STAR file into one file per `rlnTomoName` or `rlnMicrographName` |
 | `missali_report` | `missalignment/` | Summarises MissAlignment `*_alignment_loss.json` results |
 
 ## Installation
@@ -58,15 +58,23 @@ relion/compare_class3d_jobs \
 
 ### split_star_by_tomo
 
-Split a RELION STAR file into one STAR file per tomogram:
+Split a RELION STAR file into one STAR file per tomogram or micrograph.
+By default, `rlnTomoName` is used; if absent, `rlnMicrographName` is
+used as a fallback:
 
 ```bash
 relion/split_star_by_tomo run_data.star
 relion/split_star_by_tomo run_data.star -o by_tomo
 ```
 
-To also strip the `.tomostar` suffix from `rlnTomoName` values in the
-output files (useful for ArtiaX):
+Explicitly group by `rlnMicrographName`:
+
+```bash
+relion/split_star_by_tomo run_data.star --group-by rlnMicrographName
+```
+
+Strip the `.tomostar` suffix from grouping-column values in the output
+files (useful for ArtiaX):
 
 ```bash
 relion/split_star_by_tomo run_data.star --strip-tomostar-suffix

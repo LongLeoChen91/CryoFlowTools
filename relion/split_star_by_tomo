@@ -3,10 +3,15 @@
 """
 split_star_by_tomo
 
-Split a RELION STAR file into one STAR file per tomogram using rlnTomoName.
+Split a RELION STAR file into one STAR file per tomogram (or micrograph)
+using rlnTomoName or rlnMicrographName.
+
+By default the grouping column is auto-detected: rlnTomoName is
+preferred, with rlnMicrographName as a fallback. Use --group-by to
+select a specific column.
 
 Other STAR blocks, such as data_optics, are preserved in every output
-file. The original rlnTomoName values are not modified unless
+file. The original column values are not modified unless
 --strip-tomostar-suffix is used.
 
 A summary CSV is also written, sorted by particle count from largest
@@ -15,7 +20,7 @@ to smallest.
 Usage:
     split_star_by_tomo INPUT.star
 
-    split_star_by_tomo INPUT.star -o by_tomo
+    split_star_by_tomo INPUT.star --group-by rlnMicrographName
 
     split_star_by_tomo INPUT.star -o by_tomo --overwrite
 
@@ -37,16 +42,36 @@ import pandas as pd
 import starfile
 
 
-def find_tomo_column(df: pd.DataFrame) -> str | None:
+# Supported grouping columns in order of preference.
+GROUPING_COLUMNS = ["rlntomoname", "rlnmicrographname"]
+
+
+def find_grouping_column(
+    df: pd.DataFrame,
+    group_by: str = "auto",
+) -> str | None:
     """
-    Find rlnTomoName, allowing an optional leading underscore.
+    Find a grouping column in a DataFrame.
+
+    When group_by is "auto", prefer rlnTomoName over
+    rlnMicrographName. When a specific column is requested,
+    look for that column only.
     """
 
-    for column in df.columns:
-        normalized = str(column).lstrip("_").lower()
+    if group_by != "auto":
+        target = group_by.lstrip("_").lower()
 
-        if normalized == "rlntomoname":
-            return str(column)
+        for column in df.columns:
+            if str(column).lstrip("_").lower() == target:
+                return str(column)
+
+        return None
+
+    # Auto-detect: try each candidate in priority order.
+    for candidate in GROUPING_COLUMNS:
+        for column in df.columns:
+            if str(column).lstrip("_").lower() == candidate:
+                return str(column)
 
     return None
 
@@ -54,9 +79,10 @@ def find_tomo_column(df: pd.DataFrame) -> str | None:
 def find_tomo_block(
     blocks: dict,
     requested_block: str | None = None,
+    group_by: str = "auto",
 ) -> tuple[str, pd.DataFrame, str]:
     """
-    Find the STAR block containing rlnTomoName.
+    Find the STAR block containing the grouping column.
     """
 
     if requested_block is not None:
@@ -75,15 +101,17 @@ def find_tomo_block(
                 f"STAR block '{requested_block}' is not a table."
             )
 
-        tomo_column = find_tomo_column(df)
+        group_column = find_grouping_column(
+            df, group_by
+        )
 
-        if tomo_column is None:
+        if group_column is None:
             raise RuntimeError(
                 f"STAR block '{requested_block}' does not contain "
-                "rlnTomoName."
+                f"a supported grouping column (group_by={group_by})."
             )
 
-        return requested_block, df, tomo_column
+        return requested_block, df, group_column
 
     candidates = []
 
@@ -91,14 +119,16 @@ def find_tomo_block(
         if not isinstance(block_data, pd.DataFrame):
             continue
 
-        tomo_column = find_tomo_column(block_data)
+        group_column = find_grouping_column(
+            block_data, group_by
+        )
 
-        if tomo_column is not None:
+        if group_column is not None:
             candidates.append(
                 (
                     block_name,
                     block_data,
-                    tomo_column,
+                    group_column,
                 )
             )
 
@@ -106,7 +136,8 @@ def find_tomo_block(
         available = ", ".join(blocks.keys())
 
         raise RuntimeError(
-            "Could not find rlnTomoName in any STAR block.\n"
+            "Could not find a supported grouping column "
+            f"(group_by={group_by}) in any STAR block.\n"
             f"Available blocks: {available}"
         )
 
@@ -117,7 +148,7 @@ def find_tomo_block(
         )
 
         raise RuntimeError(
-            "rlnTomoName was found in more than one STAR block: "
+            "Grouping column was found in more than one STAR block: "
             f"{names}\n"
             "Use --block BLOCK_NAME to specify which block to split."
         )
@@ -127,9 +158,9 @@ def find_tomo_block(
 
 def sanitize_tomo_filename(tomo_name: str) -> str:
     """
-    Convert rlnTomoName into a safe output filename.
+    Convert a grouping-column value into a safe output filename.
 
-    The STAR metadata itself is not modified.
+    The STAR metadata column itself is not modified.
 
     Example:
         FV3h24_1001010002.tomostar
@@ -161,7 +192,7 @@ def sanitize_tomo_filename(tomo_name: str) -> str:
     if not value:
         raise ValueError(
             f"Could not generate a valid filename from "
-            f"rlnTomoName: {tomo_name!r}"
+            f"grouping value: {tomo_name!r}"
         )
 
     return value
@@ -172,7 +203,7 @@ def validate_tomo_names(
     tomo_column: str,
 ) -> None:
     """
-    Ensure all particles have valid rlnTomoName values.
+    Ensure all particles have valid grouping-column values.
     """
 
     missing = df[tomo_column].isna()
@@ -223,7 +254,7 @@ def build_output_names(
 
             if previous != tomo_name:
                 raise RuntimeError(
-                    "Two different rlnTomoName values would "
+                    "Two different grouping values would "
                     f"produce the same filename '{filename}':\n"
                     f"  {previous}\n"
                     f"  {tomo_name}"
@@ -237,7 +268,7 @@ def build_output_names(
 
 def strip_tomostar(value: str) -> str:
     """
-    Remove a trailing .tomostar suffix from an rlnTomoName value.
+    Remove a trailing .tomostar suffix from a grouping-column value.
 
     Example:
         FV3h24_1003010004.tomostar -> FV3h24_1003010004
@@ -257,9 +288,10 @@ def split_star_by_tomo(
     block_name: str | None = None,
     overwrite: bool = False,
     strip_tomostar_suffix: bool = False,
+    group_by: str = "auto",
 ) -> None:
     """
-    Split a STAR file into one STAR file per rlnTomoName.
+    Split a STAR file into one file per grouping-column value.
     """
 
     if not input_star.exists():
@@ -288,6 +320,7 @@ def split_star_by_tomo(
     ) = find_tomo_block(
         blocks,
         requested_block=block_name,
+        group_by=group_by,
     )
 
     validate_tomo_names(
@@ -296,7 +329,7 @@ def split_star_by_tomo(
     )
 
     print(f"Particle block: {particle_block_name}")
-    print(f"Tomogram column: {tomo_column}")
+    print(f"Grouping column: {tomo_column}")
     print(f"Particles: {len(particle_df)}")
 
     unique_tomos = (
@@ -382,7 +415,7 @@ def split_star_by_tomo(
 
         report.append(
             {
-                "rlnTomoName": tomo_name,
+                "group_name": tomo_name,
                 "particles": particle_count,
                 "star_file": output_filename,
             }
@@ -428,7 +461,7 @@ def split_star_by_tomo(
         index=False
     ):
         print(
-            f"{row.rlnTomoName:<50}"
+            f"{row.group_name:<50}"
             f"{row.particles:>10}"
         )
 
@@ -450,7 +483,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Split a RELION STAR file into one STAR file per "
-            "rlnTomoName while preserving other STAR blocks."
+            "rlnTomoName or rlnMicrographName while preserving "
+            "other STAR blocks."
         )
     )
 
@@ -475,8 +509,23 @@ def parse_args() -> argparse.Namespace:
         "--block",
         default=None,
         help=(
-            "Explicit STAR block containing rlnTomoName. "
+            "Explicit STAR block containing the grouping column. "
             "Normally auto-detected."
+        ),
+    )
+
+    parser.add_argument(
+        "--group-by",
+        default="auto",
+        choices=[
+            "auto",
+            "rlnTomoName",
+            "rlnMicrographName",
+        ],
+        help=(
+            "Column used to group particles "
+            "(default: auto). In auto mode, rlnTomoName is "
+            "preferred with rlnMicrographName as fallback."
         ),
     )
 
@@ -491,8 +540,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Remove trailing .tomostar suffix from "
-            "rlnTomoName values in the output STAR files. "
-            "The input file is not modified."
+            "the grouping-column values in the output "
+            "STAR files. The input file is not modified."
         ),
     )
 
@@ -508,6 +557,7 @@ def main() -> None:
         block_name=args.block,
         overwrite=args.overwrite,
         strip_tomostar_suffix=args.strip_tomostar_suffix,
+        group_by=args.group_by,
     )
 
 
