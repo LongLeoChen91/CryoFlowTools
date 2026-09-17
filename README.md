@@ -96,10 +96,6 @@ relion/merge_star_files \
     --output merged_L3.star
 ```
 
-Options: `--input` (two or more STAR files), `-o / --output` (output
-path), `--block` (explicit particle block name), `--overwrite` (replace
-existing output).
-
 ### missali_report
 
 Summarise MissAlignment alignment-loss results:
