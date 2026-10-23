@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Summarize Warp/M .species version ancestry and global-resolution changes.
+
+Read-only, standard-library-only. Works with a M population project directory,
+a species directory, or an individual .species file.
+"""
+
+import argparse
+import csv
+import math
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+def cli():
+    parser = argparse.ArgumentParser(
+        prog="m_resolution",
+        description="Inspect the recorded M species version ancestry and FSC resolution. No files are modified.",
+        epilog=("Examples: m_resolution M_FV3_Nucleosome_job028_compg022_V100; "
+                "m_resolution . --csv m_history.csv; m_resolution . --all")
+    )
+    parser.add_argument("path", nargs="?", default=".", help="M project, species directory, or .species file (default: current directory)")
+    parser.add_argument("--species", help="Species name or directory name when the project has more than one species")
+    parser.add_argument("--all", action="store_true", help="Also show versions outside the active ancestor chain")
+    parser.add_argument("--csv", metavar="FILE", help="Export rows to CSV (explicitly writes this file)")
+    parser.add_argument("--paths", action="store_true", help="Display the source XML path for each version")
+    return parser.parse_args()
+
+
+def locate_species(user_path, species_selector):
+    p = Path(user_path).expanduser().resolve()
+    if not p.exists():
+        raise ValueError(f"Path does not exist: {p}")
+    if p.is_file():
+        if p.suffix != ".species":
+            raise ValueError(f"Expected .species file, got: {p}")
+        return p
+
+    # Individual species directory, e.g. species/FV3_Nucleosome_Core_299c059f
+    direct = sorted(p.glob("*.species"))
+    if direct:
+        candidates = direct
+    else:
+        candidates = sorted(p.glob("species/*/*.species"))
+        if not candidates and p.name == "species":
+            candidates = sorted(p.glob("*/*.species"))
+
+    if species_selector:
+        candidates = [x for x in candidates if species_selector in (x.stem, x.parent.name)]
+    if not candidates:
+        nearby = sorted(x.name for x in p.glob("M_*/species")) if p.is_dir() else []
+        suggestion = f" Possible M projects here: {', '.join(nearby[:12])}" if nearby else ""
+        raise ValueError(f"No active .species found under {p}.{suggestion} Supply the M project path.")
+    if len(candidates) > 1:
+        opts = ", ".join(f"{x.parent.name}/{x.name}" for x in candidates)
+        raise ValueError(f"Found multiple species ({opts}); choose one with --species.")
+    return candidates[0]
+
+
+def parse_species(path):
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        raise ValueError(f"Invalid/incomplete species XML ({path}): {exc}") from exc
+    params = {}
+    for el in root.iter():
+        if el.tag.rsplit("}", 1)[-1] == "Param":
+            name = el.attrib.get("Name")
+            if name:
+                params[name] = el.attrib.get("Value", "")
+    version = params.get("Version", "").strip()
+    if not version:
+        raise ValueError(f"Missing Version field in: {path}")
+    return {"version": version,
+            "previous": params.get("PreviousVersion", "").strip(),
+            "resolution": numeric(params.get("GlobalResolution")),
+            "denoised": numeric(params.get("DenoisedAtResolution")),
+            "path": path}
+
+
+def numeric(v):
+    try:
+        v = float(v)
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def build_history(active_path):
+    base = active_path.parent
+    candidates = sorted((base / "versions").glob("*/*.species"))
+    records = {}
+    warnings = []
+    for f in candidates + [active_path]:  # active copy takes precedence
+        try:
+            record = parse_species(f)
+        except (OSError, ValueError) as exc:
+            warnings.append(f"Cannot read {f}: {exc}")
+            continue
+        version = record["version"]
+        if version in records:
+            old = records[version]
+            for key in ("previous", "resolution", "denoised"):
+                if old[key] != record[key]:
+                    warnings.append(f"Version {version} differs between files in {key}; using {f}")
+        records[version] = record
+    current = parse_species(active_path)["version"]
+    chain = []
+    seen = set()
+    v = current
+    while v:
+        if v not in records:
+            warnings.append(f"Missing ancestor '{v}' (the history is incomplete)")
+            break
+        if v in seen:
+            warnings.append(f"Cycle detected at version '{v}' (the history is inconsistent)")
+            break
+        seen.add(v)
+        chain.append(records[v])
+        v = records[v]["previous"]
+    chain.reverse()
+    outside = [rec for ver, rec in records.items() if ver not in seen]
+    outside.sort(key=lambda r: (r["path"].stat().st_mtime, r["version"]))
+    return current, chain, outside, warnings
+
+
+def fmt(v):
+    return f"{v:.3f}" if v is not None else "N/A"
+
+
+def rows_from_chain(chain, current):
+    rows = []
+    prev = None
+    for idx, rec in enumerate(chain):
+        v = rec["resolution"]
+        delta = v - prev if v is not None and prev is not None else None
+        if delta is None:
+            trend = "-"
+        elif delta < -0.0005:
+            trend = "better"
+        elif delta > 0.0005:
+            trend = "worse"
+        else:
+            trend = "same"
+        rows.append({"step": idx,
+                     "version": rec["version"],
+                     "previous": rec["previous"],
+                     "global_resolution_A": fmt(v),
+                     "delta_A": (f"{delta:+.3f}" if delta is not None else "-"),
+                     "denoised_at_A": fmt(rec["denoised"]),
+                     "trend": trend,
+                     "active": "yes" if rec["version"] == current else "no",
+                     "file": str(rec["path"])})
+        prev = v  # do not skip gaps in missing resolution
+    return rows
+
+
+def run():
+    args = cli()
+    try:
+        active_path = locate_species(args.path, args.species)
+        current, chain, outside, warnings = build_history(active_path)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    rows = rows_from_chain(chain, current)
+    print(f"Species: {active_path.parent.name}")
+    print(f"Active version: {current}")
+    print("Order: PreviousVersion pointers, not filenames, timestamps, or resolution ranks")
+    print()
+    print(f"{'Step':>4}  {'Version':<14} {'Global(A)':>10} {'Delta(A)':>10} {'Denoised(A)':>12}  {'Trend':<6} {'Active'}")
+    print("-" * 79)
+    for r in rows:
+        print(f"{r['step']:>4}  {r['version']:<14} {r['global_resolution_A']:>10} "
+              f"{r['delta_A']:>10} {r['denoised_at_A']:>12}  {r['trend']:<6} {r['active']}")
+        if args.paths:
+            print(f"      {r['file']}")
+
+    valid = [rec for rec in chain if rec["resolution"] is not None]
+    if valid:
+        best = min(valid, key=lambda rec: rec["resolution"])
+        print(f"\nBest GlobalResolution in active lineage: {best['resolution']:.3f} A (version {best['version']})")
+    if outside:
+        print(f"\nNOTE: {len(outside)} archived version(s) are outside the active lineage.")
+        if args.all:
+            print("Outside lineage (NOT ordered by M ancestry; shown for inspection):")
+            for rec in outside:
+                print(f"  {rec['version']:<14} prev={rec['previous']:<14} "
+                      f"Global={fmt(rec['resolution'])} A   {rec['path']}")
+    for warning in warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
+    if args.csv:
+        dst = Path(args.csv).expanduser()
+        if dst.exists():
+            print(f"ERROR: CSV already exists; refusing to overwrite: {dst}", file=sys.stderr)
+            return 2
+        with dst.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]) if rows else
+                                    ["step", "version", "previous", "global_resolution_A", "delta_A",
+                                     "denoised_at_A", "trend", "active", "file"])
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"CSV written: {dst}")
+    return 0 if not warnings else 1
+
+
+if __name__ == "__main__":
+    sys.exit(run())

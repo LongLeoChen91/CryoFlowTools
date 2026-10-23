@@ -13,6 +13,7 @@ workflows on HPC clusters.
 | `split_star_by_tomo` | `relion/` | Splits a RELION STAR file into one file per `rlnTomoName` or `rlnMicrographName` |
 | `merge_star_files` | `relion/` | Merges compatible RELION STAR files while preserving particle metadata and other blocks |
 | `missali_report` | `missalignment/` | Summarises MissAlignment `*_alignment_loss.json` results |
+| `m_resolution` | `m/` | Summarises Warp/M species refinement version ancestry and resolution history |
 
 ## Installation
 
@@ -25,7 +26,7 @@ pip install -r requirements.txt
 The scripts are standalone executables. Make them executable if needed:
 
 ```bash
-chmod +x hpc/gpuview relion/class_distribution relion/compare_class3d_jobs relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report
+chmod +x hpc/gpuview relion/class_distribution relion/compare_class3d_jobs relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution
 ```
 
 ## Usage
@@ -103,6 +104,38 @@ Summarise MissAlignment alignment-loss results:
 ```bash
 missalignment/missali_report tiltseries/
 ```
+
+### Warp/M — Refinement Resolution History
+
+`m_resolution` summarises how the global resolution of a Warp/M species
+has changed across refinement versions. It is read-only and uses only the
+Python standard library.
+
+The path may be an M project directory, a species directory, or a single
+`.species` file (default: current directory). The tool reads the active
+`.species` XML and the archived copies under `versions/`, then rebuilds
+the version ancestry by following `PreviousVersion` pointers back from the
+active `Version`. Ordering comes from these pointers, not from filenames,
+timestamps, or resolution.
+
+For each version in the active lineage it reports `GlobalResolution` and
+`DenoisedAtResolution` (Å), the change from the previous step, and a trend
+(`better` / `worse` / `same`). The best historical version is the one with
+the lowest `GlobalResolution` in the active lineage. Archived versions
+outside this lineage are counted, and listed with `--all`. Missing
+ancestors or cycles are reported as warnings.
+
+```bash
+m/m_resolution M_FV3_Nucleosome_job028_compg022_V100
+m/m_resolution . --species FV3_Nucleosome_Core_299c059f
+m/m_resolution . --all --paths
+m/m_resolution . --csv m_history.csv
+```
+
+Options: `--species` (choose a species when the project has more than one),
+`--all` (also list versions outside the active lineage), `--paths` (show the
+source XML path for each version), `--csv FILE` (export the table; existing
+files are never overwritten).
 
 ## License
 
