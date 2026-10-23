@@ -128,14 +128,18 @@ ancestors or cycles are reported as warnings.
 ```bash
 m/m_resolution M_FV3_Nucleosome_job028_compg022_V100
 m/m_resolution . --species FV3_Nucleosome_Core_299c059f
-m/m_resolution . --all --paths
+m/m_resolution . --all --show-xml-paths
 m/m_resolution . --csv m_history.csv
 ```
 
-Options: `--species` (choose a species when the project has more than one),
-`--all` (also list versions outside the active lineage), `--paths` (show the
-source XML path for each version), `--csv FILE` (export the table; existing
-files are never overwritten).
+The positional `path` is the input (M project, species directory, or
+`.species` file). `--show-xml-paths` is an output option: it prints the
+source `.species` XML file under each version row. (`--paths` is still
+accepted as a deprecated alias.)
+
+Other options: `--species` (choose a species when the project has more
+than one), `--all` (also list versions outside the active lineage),
+`--csv FILE` (export the table; existing files are never overwritten).
 
 ## License
 

@@ -18,13 +18,16 @@ def cli():
         prog="m_resolution",
         description="Inspect the recorded M species version ancestry and FSC resolution. No files are modified.",
         epilog=("Examples: m_resolution M_FV3_Nucleosome_job028_compg022_V100; "
-                "m_resolution . --csv m_history.csv; m_resolution . --all")
+                "m_resolution . --csv m_history.csv; m_resolution . --all; "
+                "m_resolution . --show-xml-paths")
     )
-    parser.add_argument("path", nargs="?", default=".", help="M project, species directory, or .species file (default: current directory)")
+    parser.add_argument("path", nargs="?", default=".", help="Input M project directory, species directory, or .species file (default: current directory)")
     parser.add_argument("--species", help="Species name or directory name when the project has more than one species")
     parser.add_argument("--all", action="store_true", help="Also show versions outside the active ancestor chain")
     parser.add_argument("--csv", metavar="FILE", help="Export rows to CSV (explicitly writes this file)")
-    parser.add_argument("--paths", action="store_true", help="Display the source XML path for each version")
+    parser.add_argument("--show-xml-paths", dest="show_xml_paths", action="store_true", help="Display the source .species XML file path for each version")
+    # Deprecated alias for --show-xml-paths; accepted but hidden from help.
+    parser.add_argument("--paths", dest="show_xml_paths", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -175,7 +178,7 @@ def run():
     for r in rows:
         print(f"{r['step']:>4}  {r['version']:<14} {r['global_resolution_A']:>10} "
               f"{r['delta_A']:>10} {r['denoised_at_A']:>12}  {r['trend']:<6} {r['active']}")
-        if args.paths:
+        if args.show_xml_paths:
             print(f"      {r['file']}")
 
     valid = [rec for rec in chain if rec["resolution"] is not None]
