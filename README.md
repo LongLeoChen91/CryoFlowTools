@@ -134,8 +134,7 @@ m/m_resolution . --csv m_history.csv
 
 The positional `path` is the input (M project, species directory, or
 `.species` file). `--show-xml-paths` is an output option: it prints the
-source `.species` XML file under each version row. (`--paths` is still
-accepted as a deprecated alias.)
+source `.species` XML file under each version row.
 
 Other options: `--species` (choose a species when the project has more
 than one), `--all` (also list versions outside the active lineage),

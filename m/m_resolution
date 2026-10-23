@@ -25,9 +25,7 @@ def cli():
     parser.add_argument("--species", help="Species name or directory name when the project has more than one species")
     parser.add_argument("--all", action="store_true", help="Also show versions outside the active ancestor chain")
     parser.add_argument("--csv", metavar="FILE", help="Export rows to CSV (explicitly writes this file)")
-    parser.add_argument("--show-xml-paths", dest="show_xml_paths", action="store_true", help="Display the source .species XML file path for each version")
-    # Deprecated alias for --show-xml-paths; accepted but hidden from help.
-    parser.add_argument("--paths", dest="show_xml_paths", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--show-xml-paths", action="store_true", help="Display the source .species XML file path for each version")
     return parser.parse_args()
 
 
