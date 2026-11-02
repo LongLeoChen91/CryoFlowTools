@@ -152,10 +152,12 @@ def relion_metadata(job, user_sym, user_diameter):
     if not symmetry:
         raise PreparationError("Cannot detect symmetry from note.txt; supply --sym")
     diameter_matches = re.findall(r"--particle_diameter(?:\s+|=)(\d+(?:\.\d+)?)", text)
-    diameter = user_diameter or (float(diameter_matches[-1]) if diameter_matches else None)
+    diameter = user_diameter if user_diameter is not None else (float(diameter_matches[-1]) if diameter_matches else None)
     if diameter is None or not math.isfinite(diameter) or diameter <= 0:
         raise PreparationError("Cannot determine particle diameter; supply --diameter in Angstrom")
-    return symmetry.upper(), diameter
+    if diameter != int(diameter):
+        raise PreparationError("MTools requires a positive whole-number diameter in Angstrom")
+    return symmetry.upper(), int(diameter)
 
 
 def star_tomograms(path):
@@ -241,7 +243,7 @@ CTF_BATCH="${{CTF_BATCH:-{gp['ctf_batch']}}}"
 [[ "$GPU_ID" =~ ^[0-9]+$ ]] || {{ echo 'ERROR: Invalid GPU_ID' >&2; exit 1; }}
 [[ "$CPU_MEMORY" == 0 || "$CPU_MEMORY" == 1 ]] || {{ echo 'ERROR: CPU_MEMORY must be 0 or 1' >&2; exit 1; }}
 [[ "$CTF_BATCH" =~ ^[1-9][0-9]*$ ]] || {{ echo 'ERROR: Invalid CTF_BATCH' >&2; exit 1; }}
-for cmd in MTools MCore; do command -v "$cmd" >/dev/null || {{ echo "ERROR: $cmd not found" >&2; exit 1; }}; done
+for cmd in python3 MTools MCore; do command -v "$cmd" >/dev/null || {{ echo "ERROR: $cmd not found" >&2; exit 1; }}; done
 for file in "$SETTINGS" "$MASK" "$SUMMARY" "$JOB/run_data.star" \\
     "$JOB/run_half1_class001_unfil.mrc" "$JOB/run_half2_class001_unfil.mrc"; do
     [[ -s "$file" ]] || {{ echo "ERROR: Missing input: $file" >&2; exit 1; }}
@@ -274,14 +276,47 @@ MEM_FLAGS=()
 [[ "$CPU_MEMORY" == 1 ]] && MEM_FLAGS+=(--cpu_memory)
 cd {q(input_data['settings_original_parent'])}
 
+verify_species() {{
+    # MTools can report failure with exit code 0; inspect registered output instead.
+    python3 - "$POP" {q(species_name)} <<'CHECK_SPECIES'
+import pathlib, sys, xml.etree.ElementTree as ET
+population = pathlib.Path(sys.argv[1])
+expected_name = sys.argv[2]
+try:
+    root = ET.parse(population).getroot()
+    entries = root.findall('./Species/Species')
+    if root.tag != 'Population' or not entries:
+        raise ValueError('Population has no registered species')
+    found = False
+    for entry in entries:
+        path = entry.get('Path', '')
+        if not path:
+            raise ValueError('Registered species has no Path')
+        species_path = population.parent / path
+        species = ET.parse(species_path).getroot()
+        if species.tag != 'Species':
+            raise ValueError(f'Invalid species XML: {{species_path}}')
+        name = species.find("./Param[@Name='Name']")
+        if name is not None and name.get('Value') == expected_name:
+            found = True
+    if not found:
+        raise ValueError(f'Expected species is not registered: {{expected_name}}')
+except (OSError, ET.ParseError, ValueError) as exc:
+    raise SystemExit(f'ERROR: Species verification failed: {{exc}}')
+print(f'Species verified: {{expected_name}}')
+CHECK_SPECIES
+}}
+
 run_step() {{
     local step="$1"
     shift
     if (( step < START_STEP || step > END_STEP )); then return 0; fi
     [[ ! -e "$OUT/.completed_step_$step" ]] || {{ echo "ERROR: Step $step already marked complete" >&2; exit 1; }}
+    if (( step >= 4 )); then verify_species; fi
     echo "====== $(date -Is) START STEP $step ======"
     printf 'Command:'; printf ' %q' "$@"; printf '\\n'
     "$@"
+    if (( step == 3 )); then verify_species; fi
     touch "$OUT/.completed_step_$step"
     echo "====== $(date -Is) FINISH STEP $step ======"
 }}
@@ -491,7 +526,7 @@ def main():
                         help="RELION binary mask extension in pixels (default: 6, dataset-dependent)")
     parser.add_argument("--mask-lowpass", type=float, default=15.0,
                         help="Mask-generation lowpass in Angstrom (default: 15)")
-    parser.add_argument("--diameter", type=float, help="M species diameter in Angstrom; overrides RELION note.txt")
+    parser.add_argument("--diameter", type=float, help="M species diameter in whole Angstrom; overrides RELION note.txt")
     parser.add_argument("--sym", help="M symmetry (must match RELION note.txt if present)")
     parser.add_argument("--image-warp", default="3x3", type=lambda x: valid_grid(x, 2))
     parser.add_argument("--higher-image-warp", default="6x6", type=lambda x: valid_grid(x, 2))
