@@ -148,11 +148,8 @@ than one), `--all` (also list versions outside the active lineage),
 
 ### Warp/M — Progressive Refinement
 
-`m_progressive` prepares inputs from a completed RELION Refine3D job and generates
-`run_m_progressive.sh` for nine stages of M setup and progressive refinement.
-It copies and checksums original Pre-M XML metadata, adjusts Warp settings,
-links tilt stacks, validates a binary mask, and writes `input_summary.json`.
-Preparation does not run M refinement and refuses an existing output directory.
+`m_progressive` prepares inputs from a completed RELION Refine3D job and
+generates a shell script for progressive Warp/M refinement.
 
 ```bash
 m/m_progressive Refine3D/job001 \
@@ -162,39 +159,19 @@ m/m_progressive Refine3D/job001 \
     --mask masks/binary_mask.mrc
 ```
 
-Use a completed job containing `RELION_JOB_EXIT_SUCCESS`, `run_data.star`,
-`run_class001.mrc`, and both `run_half{1,2}_class001_unfil.mrc` files. Supply a
-verified original Pre-M XML snapshot with names matching the tilt-stack folders.
-Omit `--mask` to generate one with RELION; mask parameters are dataset-dependent.
-Use `--sym C1 --diameter 200` if these cannot be read from `note.txt`, and
-`--tiltstack PATH` to override tilt-stack discovery. See `--help` for all options.
-
-Inspect the generated script, mask, and summary before executing on a GPU node
-or workstation. No SLURM submission or environment variables are required.
-Choose GPU 0 (default) or GPU 1 for a fresh output:
+Use a verified original Pre-M XML snapshot and a new output directory.
+Omit `--mask` to generate one with RELION. Inspect the mask and generated
+script before running refinement in your Warp/M environment on a GPU node
+or workstation:
 
 ```bash
-GPU_ID=0 bash m_runs/progressive_01/run_m_progressive.sh
-# Alternatively, run that fresh output on GPU 1:
+bash m_runs/progressive_01/run_m_progressive.sh
+# To select GPU 1 instead of the default GPU 0:
 GPU_ID=1 bash m_runs/progressive_01/run_m_progressive.sh
 ```
 
-`GPU_ID` selects MCore's device among the GPUs visible to the process. To run
-only setup and baseline, then continue the remaining stages:
-
-```bash
-GPU_ID=0 START_STEP=1 END_STEP=4 bash m_runs/progressive_01/run_m_progressive.sh
-GPU_ID=0 START_STEP=5 END_STEP=9 bash m_runs/progressive_01/run_m_progressive.sh
-```
-
-Optional runtime overrides include `CPU_MEMORY=1` and `CTF_BATCH=4`. Completed
-steps are marked; inspect partial results before resuming after a failure.
-Keep generated outputs outside Git: they contain local paths and research XML.
-STAR matching is a best-effort preview; verify source/particle matching in MTools.
-End-to-end M refinement validation is still in progress.
-
-Basic synthetic checks (no refinement software or GPUs):
-`python3 -m unittest discover -s tests -v`.
+No SLURM submission is required. Keep generated outputs outside Git because
+they contain local paths and research metadata. See `--help` for all options.
 
 ## License
 
