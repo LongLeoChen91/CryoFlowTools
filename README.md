@@ -13,6 +13,7 @@ workflows on HPC clusters.
 | `split_star_by_tomo` | `relion/` | Splits a RELION STAR file into one file per `rlnTomoName` or `rlnMicrographName` |
 | `merge_star_files` | `relion/` | Merges compatible RELION STAR files while preserving particle metadata and other blocks |
 | `missali_report` | `missalignment/` | Summarises MissAlignment `*_alignment_loss.json` results |
+| `m_progressive` | `m/` | Prepares RELION-to-M inputs and generates a progressive refinement shell script |
 | `m_resolution` | `m/` | Summarises Warp/M species refinement version ancestry and resolution history |
 
 ## Installation
@@ -26,8 +27,13 @@ pip install -r requirements.txt
 The scripts are standalone executables. Make them executable if needed:
 
 ```bash
-chmod +x hpc/gpuview relion/class_distribution relion/compare_class3d_jobs relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution
+chmod +x hpc/gpuview relion/class_distribution relion/compare_class3d_jobs relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
 ```
+
+`m_resolution` and `m_progressive` use only the Python standard library.
+For `m_progressive`, use Python 3.9+ and Bash; load RELION's `relion_mask_create`
+if generating a mask. Running the generated script also requires a working
+Warp/M environment with `MTools`, `MCore`, and CUDA dependencies.
 
 ## Usage
 
@@ -139,6 +145,56 @@ source `.species` XML file under each version row.
 Other options: `--species` (choose a species when the project has more
 than one), `--all` (also list versions outside the active lineage),
 `--csv FILE` (export the table; existing files are never overwritten).
+
+### Warp/M — Progressive Refinement
+
+`m_progressive` prepares inputs from a completed RELION Refine3D job and generates
+`run_m_progressive.sh` for nine stages of M setup and progressive refinement.
+It copies and checksums original Pre-M XML metadata, adjusts Warp settings,
+links tilt stacks, validates a binary mask, and writes `input_summary.json`.
+Preparation does not run M refinement and refuses an existing output directory.
+
+```bash
+m/m_progressive Refine3D/job001 \
+    --settings warp/tiltseries.settings \
+    --pre-m-xml snapshots/pre_m_xml \
+    --out m_runs/progressive_01 \
+    --mask masks/binary_mask.mrc
+```
+
+Use a completed job containing `RELION_JOB_EXIT_SUCCESS`, `run_data.star`,
+`run_class001.mrc`, and both `run_half{1,2}_class001_unfil.mrc` files. Supply a
+verified original Pre-M XML snapshot with names matching the tilt-stack folders.
+Omit `--mask` to generate one with RELION; mask parameters are dataset-dependent.
+Use `--sym C1 --diameter 200` if these cannot be read from `note.txt`, and
+`--tiltstack PATH` to override tilt-stack discovery. See `--help` for all options.
+
+Inspect the generated script, mask, and summary before executing on a GPU node
+or workstation. No SLURM submission or environment variables are required.
+Choose GPU 0 (default) or GPU 1 for a fresh output:
+
+```bash
+GPU_ID=0 bash m_runs/progressive_01/run_m_progressive.sh
+# Alternatively, run that fresh output on GPU 1:
+GPU_ID=1 bash m_runs/progressive_01/run_m_progressive.sh
+```
+
+`GPU_ID` selects MCore's device among the GPUs visible to the process. To run
+only setup and baseline, then continue the remaining stages:
+
+```bash
+GPU_ID=0 START_STEP=1 END_STEP=4 bash m_runs/progressive_01/run_m_progressive.sh
+GPU_ID=0 START_STEP=5 END_STEP=9 bash m_runs/progressive_01/run_m_progressive.sh
+```
+
+Optional runtime overrides include `CPU_MEMORY=1` and `CTF_BATCH=4`. Completed
+steps are marked; inspect partial results before resuming after a failure.
+Keep generated outputs outside Git: they contain local paths and research XML.
+STAR matching is a best-effort preview; verify source/particle matching in MTools.
+End-to-end M refinement validation is still in progress.
+
+Basic synthetic checks (no refinement software or GPUs):
+`python3 -m unittest discover -s tests -v`.
 
 ## License
 
