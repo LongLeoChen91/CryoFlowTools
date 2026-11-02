@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""Prepare RELION -> Warp/M inputs and generate a standalone M refinement script.
+
+CryoFlowTools: one-file, standard-library CLI. Requires relion_mask_create only when
+creating a mask; the generated GPU script requires MTools and MCore.
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.1.0"
+REQUIRED_RELION = (
+    "run_data.star",
+    "run_class001.mrc",
+    "run_half1_class001_unfil.mrc",
+    "run_half2_class001_unfil.mrc",
+)
+PARAM_RE = r'(<Param\s+Name="{name}"\s+Value=")[^"]*("\s*/>)'
+
+
+class PreparationError(Exception):
+    pass
+
+
+def require_file(path, description):
+    if not path.is_file() or path.stat().st_size == 0:
+        raise PreparationError(f"Missing or empty {description}: {path}")
+    return path
+
+
+def get_setting(text, name):
+    match = re.search(PARAM_RE.format(name=re.escape(name)), text)
+    if not match:
+        raise PreparationError(f"Missing Warp settings parameter: {name}")
+    return text[match.start(1) + len(match.group(1)): match.start(2)]
+
+
+def replace_setting(text, name, value):
+    pattern = PARAM_RE.format(name=re.escape(name))
+    new, count = re.subn(pattern, lambda m: m.group(1) + str(value) + m.group(2), text)
+    if count != 1:
+        raise PreparationError(f"Expected exactly one {name} parameter; found {count}")
+    return new
+
+
+def resolve_setting_path(base, value):
+    return (Path(value) if Path(value).is_absolute() else base / value).resolve()
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(2 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_mrc_header(path):
+    with path.open("rb") as handle:
+        header = handle.read(1024)
+    if len(header) < 1024:
+        raise PreparationError(f"Invalid MRC header: {path}")
+    for endian in ("<", ">"):
+        nx, ny, nz, mode = struct.unpack_from(endian + "4i", header, 0)
+        mx, my, mz = struct.unpack_from(endian + "3i", header, 28)
+        if not (0 < nx < 100000 and 0 < ny < 100000 and 0 < nz < 100000):
+            continue
+        if mode not in (0, 1, 2, 6) or min(mx, my, mz) <= 0:
+            continue
+        xlen, ylen, zlen = struct.unpack_from(endian + "3f", header, 40)
+        nsymbt = struct.unpack_from(endian + "i", header, 92)[0]
+        if nsymbt < 0 or not all(math.isfinite(x) and x > 0 for x in (xlen, ylen, zlen)):
+            continue
+        voxel = (xlen / mx, ylen / my, zlen / mz)
+        if any(x <= 0 or x > 100000 for x in voxel):
+            continue
+        return {"shape_xyz": (nx, ny, nz), "voxel_xyz": voxel,
+                "mode": mode, "endian": endian, "data_offset": 1024 + nsymbt}
+    raise PreparationError(f"Unsupported or invalid MRC header: {path}")
+
+
+def validate_mask(mask_path, half_paths):
+    mask_h = read_mrc_header(mask_path)
+    for half in half_paths:
+        half_h = read_mrc_header(half)
+        if half_h["shape_xyz"] != mask_h["shape_xyz"]:
+            raise PreparationError(f"Mask/half-map dimensions differ: {half}")
+        if any(abs(a - b) > 0.015 for a, b in zip(half_h["voxel_xyz"], mask_h["voxel_xyz"])):
+            raise PreparationError(f"Mask/half-map pixel sizes differ: {half}")
+    formats = {0: "b", 1: "h", 2: "f", 6: "H"}
+    fmt = mask_h["endian"] + formats[mask_h["mode"]]
+    item_size = struct.calcsize(fmt)
+    nx, ny, nz = mask_h["shape_xyz"]
+    n_voxels = nx * ny * nz
+    occupied = 0
+    mins = [nx, ny, nz]
+    maxs = [-1, -1, -1]
+    sums = [0., 0., 0.]
+    with mask_path.open("rb") as handle:
+        handle.seek(mask_h["data_offset"])
+        offset = 0
+        while offset < n_voxels:
+            count = min(200000, n_voxels - offset)
+            buf = handle.read(count * item_size)
+            if len(buf) != count * item_size:
+                raise PreparationError(f"Truncated MRC mask: {mask_path}")
+            for index, (val,) in enumerate(struct.iter_unpack(fmt, buf)):
+                if abs(val) <= 0.000001:
+                    continue
+                if not math.isfinite(val) or abs(val - 1) > 0.000001:
+                    raise PreparationError(f"Mask must contain only 0 and 1; found {val}")
+                linear = offset + index
+                x = linear % nx
+                y = (linear // nx) % ny
+                z = linear // (nx * ny)
+                for axis, pos in enumerate((x, y, z)):
+                    mins[axis] = min(mins[axis], pos)
+                    maxs[axis] = max(maxs[axis], pos)
+                    sums[axis] += pos
+                occupied += 1
+            offset += count
+    if occupied == 0 or occupied == n_voxels:
+        raise PreparationError("Mask is empty or fills the entire box")
+    return {
+        "shape_xyz": list(mask_h["shape_xyz"]),
+        "voxel_xyz_angstrom": [round(v, 5) for v in mask_h["voxel_xyz"]],
+        "foreground_voxels": occupied,
+        "occupied_percent": round(100 * occupied / n_voxels, 3),
+        "bbox_extent_xyz_angstrom": [round((maxs[i] - mins[i] + 1) * mask_h["voxel_xyz"][i], 2) for i in range(3)],
+        "center_offset_xyz_angstrom": [round((sums[i] / occupied - (mask_h["shape_xyz"][i] - 1) / 2) * mask_h["voxel_xyz"][i], 2) for i in range(3)],
+    }
+
+
+def relion_metadata(job, user_sym, user_diameter):
+    note = job / "note.txt"
+    text = note.read_text(errors="replace") if note.exists() else ""
+    sym_matches = re.findall(r"(?<!\w)--sym(?:\s+|=)([A-Za-z][A-Za-z0-9]*)", text)
+    if sym_matches and user_sym and sym_matches[-1].upper() != user_sym.upper():
+        raise PreparationError(f"Symmetry mismatch: RELION note.txt specifies {sym_matches[-1]}, not {user_sym}")
+    symmetry = (user_sym or (sym_matches[-1] if sym_matches else None))
+    if not symmetry:
+        raise PreparationError("Cannot detect symmetry from note.txt; supply --sym")
+    diameter_matches = re.findall(r"--particle_diameter(?:\s+|=)(\d+(?:\.\d+)?)", text)
+    diameter = user_diameter or (float(diameter_matches[-1]) if diameter_matches else None)
+    if diameter is None or not math.isfinite(diameter) or diameter <= 0:
+        raise PreparationError("Cannot determine particle diameter; supply --diameter in Angstrom")
+    return symmetry.upper(), diameter
+
+
+def star_tomograms(path):
+    """Best-effort preview for standard RELION particle STAR loops (no STAR rewriting)."""
+    in_loop = False
+    columns = []
+    tomo_col = None
+    names = set()
+    rows = 0
+    with path.open(errors="replace") as stream:
+        for raw in stream:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("data_") or line.lower() == "loop_":
+                in_loop = line.lower() == "loop_"
+                columns = []
+                tomo_col = None
+                continue
+            if in_loop and line.startswith("_"):
+                columns.append(line.split()[0].removeprefix("_"))
+                if "rlnTomoName" in columns:
+                    tomo_col = columns.index("rlnTomoName")
+                elif "rlnMicrographName" in columns:
+                    tomo_col = columns.index("rlnMicrographName")
+                continue
+            if in_loop and columns and tomo_col is not None:
+                fields = line.split()
+                if len(fields) < len(columns):
+                    continue
+                name = fields[tomo_col].strip("\"'")
+                names.add(Path(name).stem)
+                rows += 1
+    return sorted(names), rows
+
+
+def valid_grid(grid, dimensions):
+    segments = grid.split("x")
+    if len(segments) != dimensions or not all(s.isdigit() and int(s) >= 1 for s in segments):
+        raise argparse.ArgumentTypeError(f"Expected a {dimensions}-dimensional grid, e.g. " +
+                                         ("3x3" if dimensions == 2 else "2x2x2x10"))
+    return grid
+
+
+def safe_name(text):
+    result = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._-")
+    if not result:
+        raise PreparationError("Invalid output directory name")
+    return result
+
+
+def create_run_script(out, meta, input_data):
+    job = input_data["relion_job"]
+    q = shlex.quote
+    mroot = str(out / "m_results")
+    population_name = safe_name(out.name) + "_M"
+    pop = f"{mroot}/{population_name}.population"
+    source_name = safe_name("source_" + out.name)
+    species_name = safe_name("species_" + out.name)
+    gp = meta["recipe"]
+    script = f'''#!/usr/bin/env bash
+# Generated by CryoFlowTools m_progressive v{VERSION}.
+# Inspect mask.mrc and input_summary.json before running this script.
+# Run inside your own GPU allocation; no SLURM submission is performed here.
+set -euo pipefail
+
+OUT={q(str(out))}
+MROOT={q(mroot)}
+POP={q(pop)}
+JOB={q(job)}
+SETTINGS={q(str(out / 'warp.settings'))}
+MASK={q(str(out / 'mask.mrc'))}
+SOURCE={q(str(out / 'warp_processing'))}
+SUMMARY={q(str(out / 'input_summary.json'))}
+START_STEP="${{START_STEP:-1}}"
+END_STEP="${{END_STEP:-9}}"
+GPU_ID="${{GPU_ID:-0}}"
+CPU_MEMORY="${{CPU_MEMORY:-0}}"
+CTF_BATCH="${{CTF_BATCH:-{gp['ctf_batch']}}}"
+
+[[ "$START_STEP" =~ ^[1-9]$ && "$END_STEP" =~ ^[1-9]$ ]] || {{ echo 'ERROR: Steps must be integers 1-9' >&2; exit 1; }}
+(( START_STEP <= END_STEP )) || {{ echo 'ERROR: START_STEP exceeds END_STEP' >&2; exit 1; }}
+[[ "$GPU_ID" =~ ^[0-9]+$ ]] || {{ echo 'ERROR: Invalid GPU_ID' >&2; exit 1; }}
+[[ "$CPU_MEMORY" == 0 || "$CPU_MEMORY" == 1 ]] || {{ echo 'ERROR: CPU_MEMORY must be 0 or 1' >&2; exit 1; }}
+[[ "$CTF_BATCH" =~ ^[1-9][0-9]*$ ]] || {{ echo 'ERROR: Invalid CTF_BATCH' >&2; exit 1; }}
+for cmd in MTools MCore; do command -v "$cmd" >/dev/null || {{ echo "ERROR: $cmd not found" >&2; exit 1; }}; done
+for file in "$SETTINGS" "$MASK" "$SUMMARY" "$JOB/run_data.star" \\
+    "$JOB/run_half1_class001_unfil.mrc" "$JOB/run_half2_class001_unfil.mrc"; do
+    [[ -s "$file" ]] || {{ echo "ERROR: Missing input: $file" >&2; exit 1; }}
+done
+
+# Stage 1 must start from the untouched copied Pre-M metadata.
+if (( START_STEP == 1 )); then
+    [[ ! -e "$MROOT" ]] || {{ echo 'ERROR: M output already exists; create a new branch to restart' >&2; exit 1; }}
+    python3 - "$SUMMARY" <<'CHECK_XML'
+import hashlib, json, pathlib, sys
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+folder = pathlib.Path(manifest['output_dir']) / 'warp_processing'
+expected = manifest['xml_sha256']
+actual = {{p.name for p in folder.glob('*.xml')}}
+if actual != set(expected):
+    raise SystemExit('ERROR: Working XML filenames differ from prepared snapshot')
+for name, digest in expected.items():
+    if hashlib.sha256((folder / name).read_bytes()).hexdigest() != digest:
+        raise SystemExit(f'ERROR: Working XML modified before first run: {{name}}')
+print(f'Pre-M XML verified: {{len(expected)}} files')
+CHECK_XML
+else
+    [[ -s "$POP" ]] || {{ echo 'ERROR: M population missing' >&2; exit 1; }}
+    for ((i=1; i<START_STEP; i++)); do
+        [[ -f "$OUT/.completed_step_$i" ]] || {{ echo "ERROR: Missing completed step $i; inspect run state before continuing" >&2; exit 1; }}
+    done
+fi
+
+MEM_FLAGS=()
+[[ "$CPU_MEMORY" == 1 ]] && MEM_FLAGS+=(--cpu_memory)
+cd {q(input_data['settings_original_parent'])}
+
+run_step() {{
+    local step="$1"
+    shift
+    if (( step < START_STEP || step > END_STEP )); then return 0; fi
+    [[ ! -e "$OUT/.completed_step_$step" ]] || {{ echo "ERROR: Step $step already marked complete" >&2; exit 1; }}
+    echo "====== $(date -Is) START STEP $step ======"
+    printf 'Command:'; printf ' %q' "$@"; printf '\\n'
+    "$@"
+    touch "$OUT/.completed_step_$step"
+    echo "====== $(date -Is) FINISH STEP $step ======"
+}}
+
+echo "Node: $(hostname) | GPU ID: $GPU_ID | Steps: $START_STEP-$END_STEP"
+echo 'Review the mask and verify particle/tomogram matching from MTools output.'
+
+run_step 1 MTools create_population --directory "$MROOT" --name {q(population_name)}
+run_step 2 MTools create_source --processing_settings "$SETTINGS" \\
+    --name {q(source_name)} --population "$POP"
+run_step 3 MTools create_species --population "$POP" \\
+    --name {q(species_name)} --diameter {meta['diameter']} --sym {q(meta['symmetry'])} \\
+    --temporal_samples 1 --half1 "$JOB/run_half1_class001_unfil.mrc" \\
+    --half2 "$JOB/run_half2_class001_unfil.mrc" --mask "$MASK" \\
+    --particles_relion "$JOB/run_data.star" --lowpass {gp['species_lowpass']}
+if (( START_STEP <= 3 && END_STEP >= 3 )); then
+    MTools list_sources --population "$POP"
+    MTools list_species --population "$POP"
+    echo 'CHECK: Confirm source and species counts before interpreting the results.'
+fi
+run_step 4 MCore --population "$POP" --iter 0 \\
+    --devicelist "$GPU_ID" --perdevice_refine 1 "${{MEM_FLAGS[@]}}" --port -1
+run_step 5 MCore --population "$POP" --refine_imagewarp {gp['image_warp']} \\
+    --refine_particles --devicelist "$GPU_ID" --perdevice_refine 1 "${{MEM_FLAGS[@]}}" --port -1
+run_step 6 MCore --population "$POP" --refine_imagewarp {gp['image_warp']} \\
+    --refine_particles --devicelist "$GPU_ID" --perdevice_refine 1 "${{MEM_FLAGS[@]}}" --port -1
+run_step 7 MCore --population "$POP" --refine_imagewarp {gp['image_warp']} \\
+    --refine_particles --refine_stageangles \\
+    --devicelist "$GPU_ID" --perdevice_refine 1 "${{MEM_FLAGS[@]}}" --port -1
+run_step 8 MCore --population "$POP" --refine_imagewarp {gp['image_warp']} \\
+    --refine_particles --refine_stageangles --ctf_defocus \\
+    --ctf_defocusexhaustive --ctf_minresolution {gp['ctf_minresolution']} \\
+    --ctf_batch "$CTF_BATCH" --devicelist "$GPU_ID" \\
+    --perdevice_refine 1 "${{MEM_FLAGS[@]}}" --port -1
+run_step 9 MCore --population "$POP" --refine_imagewarp {gp['higher_image_warp']} \\
+    --refine_particles --refine_stageangles --ctf_defocus \\
+    --ctf_minresolution {gp['ctf_minresolution']} --ctf_batch "$CTF_BATCH" \\
+    --refine_volumewarp {gp['volume_warp']} --first_iteration_fraction 0.7 \\
+    --devicelist "$GPU_ID" --perdevice_refine 1 "${{MEM_FLAGS[@]}}" --port -1
+
+echo "$(date -Is) Requested steps $START_STEP-$END_STEP complete."
+'''
+    return script
+
+
+def prepare(args):
+    job = args.job.expanduser().resolve()
+    settings = require_file(args.settings.expanduser().resolve(), "Warp settings")
+    archive = args.pre_m_xml.expanduser().resolve()
+    out = args.out.expanduser().resolve()
+    if not job.is_dir():
+        raise PreparationError(f"RELION job directory does not exist: {job}")
+    for item in REQUIRED_RELION:
+        require_file(job / item, f"RELION {item}")
+    if not (job / "RELION_JOB_EXIT_SUCCESS").exists():
+        raise PreparationError("RELION completion marker missing; use a completed Refine3D job")
+    if not archive.is_dir():
+        raise PreparationError(f"Pre-M XML directory does not exist: {archive}")
+    if out.exists() or out.is_symlink():
+        raise PreparationError(f"Output exists; choose a NEW --out path: {out}")
+    if out == archive or out == job or out == settings.parent:
+        raise PreparationError("Output directory must be independent of the inputs")
+    xml_files = sorted(archive.glob("*.xml"))
+    if not xml_files:
+        raise PreparationError(f"No XML files found in --pre-m-xml: {archive}")
+    for path in xml_files:
+        require_file(path, "Pre-M XML")
+
+    source_text = settings.read_text()
+    original_processing = resolve_setting_path(settings.parent, get_setting(source_text, "ProcessingFolder"))
+    original_data = resolve_setting_path(settings.parent, get_setting(source_text, "DataFolder"))
+    if not original_data.is_dir():
+        raise PreparationError(f"Warp DataFolder does not exist: {original_data}")
+    tiltstack = (args.tiltstack.expanduser().resolve() if args.tiltstack else
+                 (original_processing / "tiltstack").resolve())
+    if not tiltstack.is_dir():
+        raise PreparationError(f"Cannot locate tiltstack at {tiltstack}. Supply --tiltstack")
+    stack_names = {p.name for p in tiltstack.iterdir() if p.is_dir()}
+    xml_names = {p.stem for p in xml_files}
+    missing_stack = sorted(xml_names - stack_names)
+    if missing_stack:
+        raise PreparationError(f"Missing tiltstack directories for {len(missing_stack)} XML files: {missing_stack[:5]}")
+    if not (args.mask and args.mask.exists()) and not shutil.which("relion_mask_create"):
+        raise PreparationError("relion_mask_create not on PATH; load RELION or supply --mask")
+    if args.mask:
+        require_file(args.mask.expanduser().resolve(), "user mask")
+
+    symmetry, diameter = relion_metadata(job, args.sym, args.diameter)
+    tomograms, rows = star_tomograms(job / "run_data.star")
+    if tomograms:
+        missing = sorted(set(tomograms) - xml_names)
+        if missing:
+            raise PreparationError(
+                f"Particle STAR references {len(missing)} tomograms with no matching XML: {missing[:5]}. "
+                "Check RELION/Warp naming or use the correct Pre-M snapshot.")
+
+    recipe = {
+        "image_warp": args.image_warp,
+        "higher_image_warp": args.higher_image_warp,
+        "volume_warp": args.volume_warp,
+        "ctf_minresolution": args.ctf_minresolution,
+        "ctf_batch": args.ctf_batch,
+        "species_lowpass": args.species_lowpass,
+    }
+    meta = {"symmetry": symmetry, "diameter": diameter, "recipe": recipe}
+    folder_data = str(original_data)
+    folder_processing = str(out / "warp_processing")
+    new_settings = replace_setting(source_text, "DataFolder", folder_data)
+    new_settings = replace_setting(new_settings, "ProcessingFolder", folder_processing)
+    if re.search(PARAM_RE.format(name="UseRelativePaths"), new_settings):
+        new_settings = replace_setting(new_settings, "UseRelativePaths", "False")
+    for extra in ("GainPath", "DefectsPath"):
+        if not re.search(PARAM_RE.format(name=extra), new_settings):
+            continue
+        path_str = get_setting(new_settings, extra)
+        if path_str:
+            resolved = resolve_setting_path(settings.parent, path_str)
+            if resolved.exists():
+                new_settings = replace_setting(new_settings, extra, str(resolved))
+            else:
+                print(f"WARNING: {extra} not found relative to original settings: {path_str}", file=sys.stderr)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".m_progressive_", dir=out.parent) as temp:
+        stage = Path(temp) / "working"
+        process = stage / "warp_processing"
+        process.mkdir(parents=True)
+        hashes = {}
+        for source in xml_files:
+            target = process / source.name
+            shutil.copy2(source, target)
+            src_hash = sha256(source)
+            if sha256(target) != src_hash:
+                raise PreparationError(f"XML checksum verification failed: {source.name}")
+            hashes[source.name] = src_hash
+        (process / "tiltstack").symlink_to(tiltstack, target_is_directory=True)
+        (stage / "warp.settings").write_text(new_settings)
+        mask = stage / "mask.mrc"
+        if args.mask:
+            shutil.copy2(args.mask.expanduser().resolve(), mask)
+        else:
+            command = ["relion_mask_create", "--i", str(job / "run_class001.mrc"),
+                       "--o", str(mask), "--lowpass", str(args.mask_lowpass),
+                       "--ini_threshold", str(args.mask_threshold),
+                       "--extend_inimask", str(args.mask_ext), "--width_soft_edge", "0"]
+            print("Generating binary mask:", shlex.join(command), flush=True)
+            subprocess.run(command, check=True)
+        mask_qc = validate_mask(mask, [job / "run_half1_class001_unfil.mrc",
+                                        job / "run_half2_class001_unfil.mrc"])
+        manifest = {
+            "tool": "CryoFlowTools/m_progressive", "version": VERSION,
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "output_dir": str(out), "relion_job": str(job),
+            "settings_original": str(settings), "settings_original_parent": str(settings.parent),
+            "pre_m_xml_source": str(archive), "xml_count": len(xml_files),
+            "xml_sha256": hashes, "original_tiltstack": str(tiltstack),
+            "data_folder": str(original_data), "symmetry": symmetry, "diameter": diameter,
+            "star_detected_tomograms": len(tomograms) if tomograms else None,
+            "star_counted_rows": rows if tomograms else None,
+            "mask_source": str(args.mask.expanduser().resolve()) if args.mask else str(job / "run_class001.mrc"),
+            "mask_parameters": {"lowpass": args.mask_lowpass,
+                                "threshold": args.mask_threshold, "extension_pixels": args.mask_ext,
+                                "soft_edge_pixels": 0} if not args.mask else {"provided_by_user": True},
+            "mask_qc": mask_qc, "recipe": recipe,
+        }
+        (stage / "input_summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        script = create_run_script(out, meta, manifest)
+        runner = stage / "run_m_progressive.sh"
+        runner.write_text(script)
+        runner.chmod(0o755)
+        subprocess.run(["bash", "-n", str(runner)], check=True)
+        if out.exists() or out.is_symlink():
+            raise PreparationError(f"Output appeared while preparing: {out}")
+        stage.rename(out)
+    print(f"\nPREPARATION COMPLETE: {out}")
+    print(f"  RELION:      {job}")
+    print(f"  Symmetry:    {symmetry}")
+    print(f"  Diameter:    {diameter:g} A")
+    print(f"  Pre-M XML:   {len(xml_files)} files (copied and checksummed)")
+    print(f"  Tilt stacks: {tiltstack} (symlinked)")
+    print(f"  STAR tomos:  {len(tomograms) if tomograms else 'not detected'}")
+    print(f"  Mask voxels: {mask_qc['foreground_voxels']:,} ({mask_qc['occupied_percent']:.3f}%)")
+    print(f"  Mask extent: {mask_qc['bbox_extent_xyz_angstrom']} A (XYZ)")
+    print(f"  Run script:  {out / 'run_m_progressive.sh'}")
+    print("\nREQUIRED: Visually inspect mask.mrc against the RELION map.")
+    print("Then enter your GPU allocation and run:")
+    print(f"  bash {shlex.quote(str(out / 'run_m_progressive.sh'))}")
+    print("To run the baseline only, use START_STEP=1 END_STEP=4.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="m_progressive",
+        description="Prepare RELION-to-M inputs and generate a self-contained GPU refinement script.",
+        epilog=("Example: m_progressive Refine3D/job001 --settings warp/tiltseries.settings "
+                "--pre-m-xml snapshots/pre_m_xml --out m_runs/progressive_01")
+    )
+    parser.add_argument("job", type=Path, help="Completed RELION Refine3D/jobNNN directory")
+    parser.add_argument("--settings", required=True, type=Path, help="Original Warp tilt-series .settings")
+    parser.add_argument("--pre-m-xml", required=True, type=Path, help="Verified ORIGINAL Pre-M XML directory")
+    parser.add_argument("--out", required=True, type=Path, help="NEW output directory (must not exist)")
+    parser.add_argument("--tiltstack", type=Path, help="Tiltstack directory if not found from Warp settings")
+    parser.add_argument("--mask", type=Path, help="Existing binary mask (skips mask generation)")
+    parser.add_argument("--mask-threshold", type=float, default=0.005,
+                        help="RELION mask threshold (default: 0.005, dataset-dependent)")
+    parser.add_argument("--mask-ext", type=int, default=6,
+                        help="RELION binary mask extension in pixels (default: 6, dataset-dependent)")
+    parser.add_argument("--mask-lowpass", type=float, default=15.0,
+                        help="Mask-generation lowpass in Angstrom (default: 15)")
+    parser.add_argument("--diameter", type=float, help="M species diameter in Angstrom; overrides RELION note.txt")
+    parser.add_argument("--sym", help="M symmetry (must match RELION note.txt if present)")
+    parser.add_argument("--image-warp", default="3x3", type=lambda x: valid_grid(x, 2))
+    parser.add_argument("--higher-image-warp", default="6x6", type=lambda x: valid_grid(x, 2))
+    parser.add_argument("--volume-warp", default="2x2x2x10", type=lambda x: valid_grid(x, 4))
+    parser.add_argument("--ctf-minresolution", type=float, default=8., help="M CTF minimum resolution (A)")
+    parser.add_argument("--ctf-batch", type=int, default=8, help="MCore CTF batch size")
+    parser.add_argument("--species-lowpass", type=float, default=12., help="MTools species initial lowpass (A)")
+    parser.add_argument("--version", action="version", version=VERSION)
+    args = parser.parse_args()
+    if args.mask_ext < 0 or not all(math.isfinite(x) and x > 0 for x in (
+            args.mask_lowpass, args.ctf_minresolution, args.species_lowpass)):
+        parser.error("Mask extension must be >=0 and resolution values must be positive")
+    if not math.isfinite(args.mask_threshold) or args.mask_threshold < 0:
+        parser.error("Mask threshold must be finite and non-negative")
+    if args.ctf_batch < 1:
+        parser.error("CTF batch must be a positive integer")
+    try:
+        prepare(args)
+    except (PreparationError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
