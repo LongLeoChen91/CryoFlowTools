@@ -8,11 +8,11 @@ workflows on HPC clusters.
 | Tool | Location | Description |
 |------|----------|-------------|
 | `gpuview` | `hpc/` | Summarises Slurm GPU-node resources and running jobs |
+| `missali_report` | `missalignment/` | Summarises MissAlignment `*_alignment_loss.json` results |
 | `class_distribution` | `relion/` | Tracks RELION Class3D class distributions across iterations |
 | `compare_class3d_jobs` | `relion/` | Compares particle class assignments between two RELION Class3D `*_data.star` files |
 | `split_star_by_tomo` | `relion/` | Splits a RELION STAR file into one file per `rlnTomoName` or `rlnMicrographName` |
 | `merge_star_files` | `relion/` | Merges compatible RELION STAR files while preserving particle metadata and other blocks |
-| `missali_report` | `missalignment/` | Summarises MissAlignment `*_alignment_loss.json` results |
 | `m_progressive` | `m/` | Prepares RELION-to-M inputs and generates a progressive refinement shell script |
 | `m_resolution` | `m/` | Summarises Warp/M species refinement version ancestry and resolution history |
 
