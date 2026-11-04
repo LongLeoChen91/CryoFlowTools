@@ -17,6 +17,8 @@ squeue, sinfo, sprio, and optionally sacctmgr show) to explain:
 
 jobdiag explains scheduler-visible evidence. It does not reproduce or
 predict the complete SLURM scheduler.
+
+Developed and maintained by Long Chen.
 """
 
 from __future__ import annotations

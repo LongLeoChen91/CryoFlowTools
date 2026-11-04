@@ -3,6 +3,8 @@
 
 CryoFlowTools: one-file, standard-library CLI. Requires relion_mask_create only when
 creating a mask; the generated GPU script requires MTools and MCore.
+
+Developed and maintained by Long Chen.
 """
 
 import argparse

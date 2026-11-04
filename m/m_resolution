@@ -3,6 +3,8 @@
 
 Read-only, standard-library-only. Works with a M population project directory,
 a species directory, or an individual .species file.
+
+Developed and maintained by Long Chen.
 """
 
 import argparse
