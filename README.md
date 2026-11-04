@@ -8,6 +8,7 @@ workflows on HPC clusters.
 | Tool | Location | Description |
 |------|----------|-------------|
 | `gpuview` | `hpc/` | Summarises Slurm GPU-node resources and running jobs |
+| `jobdiag` | `hpc/` | Read-only Slurm job diagnostics for pending reasons, resource fit, and scheduler state |
 | `missali_report` | `missalignment/` | Summarises MissAlignment `*_alignment_loss.json` results |
 | `class_distribution` | `relion/` | Tracks RELION Class3D class distributions across iterations |
 | `compare_class3d_jobs` | `relion/` | Compares particle class assignments between two RELION Class3D `*_data.star` files |
@@ -27,7 +28,7 @@ pip install -r requirements.txt
 The scripts are standalone executables. Make them executable if needed:
 
 ```bash
-chmod +x hpc/gpuview relion/class_distribution relion/compare_class3d_jobs relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
+chmod +x hpc/gpuview hpc/jobdiag relion/class_distribution relion/compare_class3d_jobs relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
 ```
 
 `m_resolution` and `m_progressive` use only the Python standard library.
@@ -45,6 +46,25 @@ Display Slurm GPU partition status (run on a login node):
 hpc/gpuview
 hpc/gpuview gpu_strubi
 ```
+
+### jobdiag
+
+Diagnose Slurm jobs using scheduler-visible state, requested resources, candidate-node capacity, and pending reasons.
+
+```bash
+hpc/jobdiag 34378338
+hpc/jobdiag 34378338 --verbose
+hpc/jobdiag 34378338 --no-color
+hpc/jobdiag 34378338 --partition gpu_interactive
+```
+
+`jobdiag` handles both running and pending jobs, including resource shortages, node states, priority waits, scheduled starts, job holds, dependencies, partition configuration, and multi-partition submissions.
+
+`--partition PARTITION` evaluates the existing resource request against an alternative partition without modifying or resubmitting the job. Use `--verbose` to show detailed evidence, classifications, and commands executed.
+
+`jobdiag` is strictly read-only: it inspects Slurm state but never submits, cancels, holds, releases, requeues, or modifies jobs.
+
+> Scheduler-visible evidence can be incomplete. When the exact blocker cannot be established reliably, `jobdiag` reports it as unknown rather than guessing.
 
 ### class_distribution
 

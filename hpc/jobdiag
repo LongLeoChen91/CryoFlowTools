@@ -1,0 +1,4781 @@
+#!/apps/strubi/software/packages/miniforge3/envs/miss-alignment/bin/python
+
+"""
+jobdiag
+
+Lightweight, read-only SLURM job diagnostics CLI for BMRC.
+
+The script inspects SLURM state using read-only commands (scontrol show,
+squeue, sinfo, sprio, and optionally sacctmgr show) to explain:
+    - what resources a job requested
+    - which candidate nodes are statically eligible
+    - which eligible nodes currently have enough unallocated resources
+    - whether node states (DRAIN, DOWN, NOT_RESPONDING, MAINT, PLANNED)
+      affect scheduling
+    - what SLURM reports as the pending reason, expected start, and priority
+    - what evidence-based action is supported
+
+jobdiag explains scheduler-visible evidence. It does not reproduce or
+predict the complete SLURM scheduler.
+"""
+
+from __future__ import annotations
+
+# ============================================================================
+# 1. imports
+# ============================================================================
+
+import argparse
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+import re
+import shlex
+import subprocess
+import sys
+from typing import Any, Callable
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+
+# ============================================================================
+# 2. constants / enums
+# ============================================================================
+
+ALLOWED_COMMAND_PREFIXES: tuple[tuple[str, ...], ...] = (
+    ("scontrol", "show"),
+    ("squeue",),
+    ("sinfo",),
+    ("sprio",),
+    ("sacctmgr", "show"),
+)
+
+FORBIDDEN_COMMANDS: frozenset[str] = frozenset(
+    {
+        "scancel",
+        "shold",
+        "srelease",
+        "sbatch",
+        "srun",
+        "salloc",
+        "strigger",
+    }
+)
+
+FORBIDDEN_SCONTROL_SUBCOMMANDS: frozenset[str] = frozenset(
+    {
+        "update",
+        "requeue",
+        "requeuehold",
+        "hold",
+        "uhold",
+        "release",
+        "suspend",
+        "resume",
+        "top",
+        "create",
+        "delete",
+        "shutdown",
+        "reboot",
+        "cancel_reboot",
+    }
+)
+
+HARD_UNSCHEDULABLE_STATES: frozenset[str] = frozenset(
+    {
+        "DOWN",
+        "DRAIN",
+        "DRAINED",
+        "DRAINING",
+        "FAIL",
+        "FAILING",
+        "NOT_RESPONDING",
+        "MAINT",
+        "POWER_DOWN",
+        "POWERING_DOWN",
+        "FUTURE",
+    }
+)
+
+NULL_STRINGS: frozenset[str] = frozenset(
+    {"", "(null)", "null", "none", "n/a", "unknown"}
+)
+
+SNAPSHOT_COMPARE_FIELDS: tuple[str, ...] = (
+    "JobState",
+    "Reason",
+    "StartTime",
+    "SchedNodeList",
+    "NodeList",
+    "Priority",
+    "ReqTRES",
+    "TimeLimit",
+)
+
+
+class TriState(str, Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+    UNKNOWN = "UNKNOWN"
+
+
+class Confidence(str, Enum):
+    CONFIRMED = "CONFIRMED"
+    SUPPORTED = "SUPPORTED"
+    POSSIBLE = "POSSIBLE"
+
+
+class NodeClassification(str, Enum):
+    ELIGIBLE_FITS_NOW = "ELIGIBLE_FITS_NOW"
+    ELIGIBLE_GPU_SHORTAGE = "ELIGIBLE_GPU_SHORTAGE"
+    ELIGIBLE_CPU_SHORTAGE = "ELIGIBLE_CPU_SHORTAGE"
+    ELIGIBLE_MEMORY_SHORTAGE = "ELIGIBLE_MEMORY_SHORTAGE"
+    ELIGIBLE_MULTIPLE_SHORTAGES = "ELIGIBLE_MULTIPLE_SHORTAGES"
+    ELIGIBLE_NODE_UNSCHEDULABLE = "ELIGIBLE_NODE_UNSCHEDULABLE"
+    ELIGIBLE_PLANNED_REVIEW_REQUIRED = "ELIGIBLE_PLANNED_REVIEW_REQUIRED"
+
+    INELIGIBLE_PARTITION = "INELIGIBLE_PARTITION"
+    INELIGIBLE_GPU_TYPE = "INELIGIBLE_GPU_TYPE"
+    INELIGIBLE_TOTAL_GPU_CAPACITY = "INELIGIBLE_TOTAL_GPU_CAPACITY"
+    INELIGIBLE_TOTAL_CPU_CAPACITY = "INELIGIBLE_TOTAL_CPU_CAPACITY"
+    INELIGIBLE_TOTAL_MEMORY_CAPACITY = "INELIGIBLE_TOTAL_MEMORY_CAPACITY"
+    INELIGIBLE_CONSTRAINT = "INELIGIBLE_CONSTRAINT"
+    INELIGIBLE_NODE_LIST = "INELIGIBLE_NODE_LIST"
+
+
+class DiagnosisCode(str, Enum):
+    JOB_ALREADY_RUNNING = "JOB_ALREADY_RUNNING"
+
+    JOB_HELD_ADMIN = "JOB_HELD_ADMIN"
+    JOB_HELD_USER = "JOB_HELD_USER"
+    DEPENDENCY_WAIT = "DEPENDENCY_WAIT"
+    DEPENDENCY_FAILED = "DEPENDENCY_FAILED"
+    JOB_ARRAY_TASK_LIMIT = "JOB_ARRAY_TASK_LIMIT"
+    PARTITION_CONFIG_BLOCK = "PARTITION_CONFIG_BLOCK"
+
+    NO_STATICALLY_ELIGIBLE_NODE = "NO_STATICALLY_ELIGIBLE_NODE"
+
+    CURRENT_GPU_SHORTAGE = "CURRENT_GPU_SHORTAGE"
+    CURRENT_CPU_SHORTAGE = "CURRENT_CPU_SHORTAGE"
+    CURRENT_MEMORY_SHORTAGE = "CURRENT_MEMORY_SHORTAGE"
+    CURRENT_MULTIPLE_RESOURCE_SHORTAGES = "CURRENT_MULTIPLE_RESOURCE_SHORTAGES"
+
+    NODE_DRAINED = "NODE_DRAINED"
+    NODE_DOWN = "NODE_DOWN"
+    NODE_NOT_RESPONDING = "NODE_NOT_RESPONDING"
+    NODE_MAINTENANCE = "NODE_MAINTENANCE"
+    NODE_PLANNED = "NODE_PLANNED"
+
+    PARTITION_TIME_LIMIT_EXCEEDED = "PARTITION_TIME_LIMIT_EXCEEDED"
+    ACCOUNT_NOT_ALLOWED = "ACCOUNT_NOT_ALLOWED"
+    QOS_NOT_ALLOWED = "QOS_NOT_ALLOWED"
+
+    PRIORITY_WAIT = "PRIORITY_WAIT"
+
+    RESERVATION_OVERLAP = "RESERVATION_OVERLAP"
+    FUTURE_SCHEDULED_JOB_CONFLICT = "FUTURE_SCHEDULED_JOB_CONFLICT"
+
+    SCHEDULED_FUTURE_START = "SCHEDULED_FUTURE_START"
+    RESOURCE_FIT_BUT_PENDING = "RESOURCE_FIT_BUT_PENDING"
+
+    REASON_NONE_TRANSIENT = "REASON_NONE_TRANSIENT"
+
+    SCHEDULER_STATE_CHANGED = "SCHEDULER_STATE_CHANGED"
+
+    EXACT_BLOCKER_UNKNOWN = "EXACT_BLOCKER_UNKNOWN"
+
+
+class RecommendationCode(str, Enum):
+    WAIT = "WAIT"
+    KEEP_CURRENT_REQUEST = "KEEP_CURRENT_REQUEST"
+
+    RELEASE_HOLD = "RELEASE_HOLD"
+    WAIT_FOR_DEPENDENCY = "WAIT_FOR_DEPENDENCY"
+    REVIEW_FAILED_DEPENDENCY = "REVIEW_FAILED_DEPENDENCY"
+    WAIT_FOR_ARRAY_TASKS = "WAIT_FOR_ARRAY_TASKS"
+    REVIEW_ARRAY_CONCURRENCY = "REVIEW_ARRAY_CONCURRENCY"
+
+    REDUCE_MEMORY_IF_SAFE = "REDUCE_MEMORY_IF_SAFE"
+    REDUCE_CPU_IF_SAFE = "REDUCE_CPU_IF_SAFE"
+    REDUCE_GPU_IF_APPLICATION_SUPPORTS = "REDUCE_GPU_IF_APPLICATION_SUPPORTS"
+
+    SHORTEN_TIMELIMIT_IF_REALISTIC = "SHORTEN_TIMELIMIT_IF_REALISTIC"
+
+    USE_OTHER_PARTITION = "USE_OTHER_PARTITION"
+    REVIEW_NODE_CONSTRAINT = "REVIEW_NODE_CONSTRAINT"
+
+    WAIT_FOR_NODE_RECOVERY = "WAIT_FOR_NODE_RECOVERY"
+
+    CHECK_CLUSTER_POLICY = "CHECK_CLUSTER_POLICY"
+
+
+# ============================================================================
+# 3. data models
+# ============================================================================
+
+
+@dataclass
+class CommandResult:
+    command: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+    ok: bool
+    error: str | None = None
+
+
+@dataclass
+class ResourceRequest:
+    cpus: int | None = None
+    memory_mb: int | None = None
+    memory_raw: str | None = None
+    nodes: int = 1
+    gpu_count: int = 0
+    gpu_type: str | None = None
+    time_limit_seconds: int | None = None
+    time_limit_raw: str | None = None
+    time_limit_unlimited: bool = False
+    constraints: set[str] = field(default_factory=set)
+    constraints_raw: str | None = None
+    req_nodes: set[str] = field(default_factory=set)
+    req_nodes_raw: str | None = None
+    exc_nodes: set[str] = field(default_factory=set)
+    exc_nodes_raw: str | None = None
+    min_memory_node_raw: str | None = None
+    min_memory_cpu_raw: str | None = None
+    min_memory_tres_raw: str | None = None
+
+
+@dataclass
+class JobInfo:
+    job_id: str
+    name: str = ""
+    user: str = ""
+    account: str = ""
+    qos: str = ""
+    partition: str = ""
+    partitions: list[str] = field(default_factory=list)
+    state: str = ""
+    reason: str = ""
+    priority: int | None = None
+    submit_time: datetime | None = None
+    submit_time_raw: str | None = None
+    start_time: datetime | None = None
+    start_time_raw: str | None = None
+    end_time: datetime | None = None
+    end_time_raw: str | None = None
+    run_time_seconds: int | None = None
+    run_time_raw: str | None = None
+    node_list: list[str] = field(default_factory=list)
+    node_list_raw: str | None = None
+    sched_node_list: list[str] = field(default_factory=list)
+    sched_node_list_raw: str | None = None
+    dependency_raw: str | None = None
+    req_tres_raw: str | None = None
+    alloc_tres_raw: str | None = None
+    allocated_gpus: int | None = None
+    allocated_gpu_type: str | None = None
+    allocated_cpus: int | None = None
+    allocated_memory_mb: int | None = None
+    request: ResourceRequest = field(default_factory=ResourceRequest)
+    raw_fields: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.partitions and self.partition:
+            self.partitions = [
+                p.strip()
+                for p in self.partition.split(",")
+                if p.strip() and p.strip().lower() not in NULL_STRINGS
+            ]
+
+
+@dataclass
+class NodeInfo:
+    name: str
+    state_raw: str = "UNKNOWN"
+    state_flags: set[str] = field(default_factory=set)
+    reason: str | None = None
+    partitions: set[str] = field(default_factory=set)
+    cpu_total: int | None = None
+    cpu_alloc: int | None = None
+    cpu_load: float | None = None
+    cpu_load_raw: str | None = None
+    memory_total_mb: int | None = None
+    memory_alloc_mb: int | None = None
+    gpu_total: int | None = None
+    gpu_allocated: int | None = None
+    gpu_free: int | None = None
+    gpu_type: str | None = None
+    gres_raw: str | None = None
+    cfg_tres_raw: str | None = None
+    alloc_tres_raw: str | None = None
+    features: set[str] = field(default_factory=set)
+    raw_fields: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def cpu_free(self) -> int | None:
+        if self.cpu_total is None or self.cpu_alloc is None:
+            return None
+        return max(0, self.cpu_total - self.cpu_alloc)
+
+    @property
+    def memory_free_mb(self) -> int | None:
+        if self.memory_total_mb is None or self.memory_alloc_mb is None:
+            return None
+        return max(0, self.memory_total_mb - self.memory_alloc_mb)
+
+
+@dataclass
+class PartitionInfo:
+    name: str
+    state: str = "UP"
+    max_time_seconds: int | None = None
+    max_time_raw: str | None = None
+    max_time_unlimited: bool = False
+    max_nodes: int | None = None
+    max_cpus_per_node: int | None = None
+    max_mem_per_node_mb: int | None = None
+    allow_accounts: set[str] | None = None
+    deny_accounts: set[str] = field(default_factory=set)
+    allow_qos: set[str] | None = None
+    deny_qos: set[str] = field(default_factory=set)
+    nodes: list[str] = field(default_factory=list)
+    nodes_raw: str | None = None
+    qos: str | None = None
+    raw_fields: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ReservationInfo:
+    name: str
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    start_time_raw: str | None = None
+    end_time_raw: str | None = None
+    nodes: set[str] = field(default_factory=set)
+    nodes_raw: str | None = None
+    state: str = ""
+    flags: set[str] = field(default_factory=set)
+    users: set[str] = field(default_factory=set)
+    accounts: set[str] = field(default_factory=set)
+    partition: str | None = None
+    tres_raw: str | None = None
+    raw_fields: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class PriorityInfo:
+    job_id: str
+    partition: str = ""
+    priority: int | None = None
+    site: int | None = None
+    age: int | None = None
+    fairshare: int | None = None
+    qos: int | None = None
+    raw_fields: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class CandidateNodeAssessment:
+    node_name: str
+    node: NodeInfo
+    statically_eligible: TriState
+    fits_now: TriState
+    classification: str
+    partition_fit: TriState = TriState.PASS
+    node_list_fit: TriState = TriState.PASS
+    constraint_fit: TriState = TriState.PASS
+    gpu_type_fit: TriState = TriState.PASS
+    total_gpu_fit: TriState = TriState.PASS
+    total_cpu_fit: TriState = TriState.PASS
+    total_memory_fit: TriState = TriState.PASS
+    node_schedulable: TriState = TriState.PASS
+    current_gpu_fit: TriState = TriState.PASS
+    current_cpu_fit: TriState = TriState.PASS
+    current_memory_fit: TriState = TriState.PASS
+    is_planned: bool = False
+    matched_partitions: list[str] = field(default_factory=list)
+    unschedulable_reasons: list[str] = field(default_factory=list)
+    shortage_resources: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DiagnosisFinding:
+    code: str
+    confidence: str
+    summary: str
+    details: str | None = None
+    evidence: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Recommendation:
+    code: str
+    text: str
+    reason_codes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AcquisitionSnapshot:
+    job_snapshot_a: JobInfo
+    job_snapshot_b: JobInfo | None = None
+    submitted_partition: PartitionInfo | None = None
+    evaluation_partition: PartitionInfo | None = None
+    submitted_partitions: dict[str, PartitionInfo] = field(default_factory=dict)
+    evaluation_partitions: dict[str, PartitionInfo] = field(default_factory=dict)
+    nodes: dict[str, NodeInfo] = field(default_factory=dict)
+    squeue_start_info: dict[str, str] = field(default_factory=dict)
+    priority_info: PriorityInfo | None = None
+    reservations: list[ReservationInfo] = field(default_factory=list)
+    competitor_jobs: list[JobInfo] = field(default_factory=list)
+    pending_queue_summary: dict[str, int] = field(default_factory=dict)
+    skipped_array_entries: list[str] = field(default_factory=list)
+    account_ancestors: set[str] = field(default_factory=set)
+    account_hierarchy_complete: bool = False
+    allowed_qos_for_assoc: set[str] | None = None
+    snapshot_changed: bool = False
+    changed_fields: list[str] = field(default_factory=list)
+    commands_run: list[str] = field(default_factory=list)
+    skipped_queries: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    reference_time: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.submitted_partitions and self.submitted_partition is not None:
+            self.submitted_partitions = {
+                self.submitted_partition.name: self.submitted_partition
+            }
+        elif self.submitted_partition is None and self.submitted_partitions:
+            self.submitted_partition = next(iter(self.submitted_partitions.values()))
+        if not self.evaluation_partitions and self.evaluation_partition is not None:
+            self.evaluation_partitions = {
+                self.evaluation_partition.name: self.evaluation_partition
+            }
+        elif self.evaluation_partition is None and self.evaluation_partitions:
+            self.evaluation_partition = next(iter(self.evaluation_partitions.values()))
+
+
+@dataclass
+class DiagnosisReport:
+    job: JobInfo
+    submitted_partition_name: str
+    evaluation_partition_name: str
+    partition: PartitionInfo | None
+    partitions: dict[str, PartitionInfo] = field(default_factory=dict)
+    node_assessments: list[CandidateNodeAssessment] = field(default_factory=list)
+    findings: list[DiagnosisFinding] = field(default_factory=list)
+    recommendations: list[Recommendation] = field(default_factory=list)
+    snapshot: AcquisitionSnapshot | None = None
+    qos_fit: TriState = TriState.UNKNOWN
+    account_fit: TriState = TriState.UNKNOWN
+    time_limit_fit: TriState = TriState.UNKNOWN
+    reservation_conflict: TriState = TriState.UNKNOWN
+
+
+# ============================================================================
+# 4. generic utilities
+# ============================================================================
+
+
+def is_null_value(value: str | None) -> bool:
+    if value is None:
+        return True
+    return value.strip().lower() in NULL_STRINGS
+
+
+def parse_partition_list(raw: str | None) -> list[str]:
+    """
+    Parse a SLURM Partition field (single or comma-separated list) into an
+    ordered, deduplicated list of partition names.
+    """
+    if is_null_value(raw):
+        return []
+    assert raw is not None
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        p = part.strip()
+        if p and not is_null_value(p) and p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
+
+
+def normalize_node_name(name: str) -> str:
+    return name.strip().split(".")[0]
+
+
+def expand_nodelist(expr: str | None) -> list[str]:
+    """
+    Expand a SLURM nodelist expression such as 'compg[027,037-038]' into
+    individual normalized node names.
+    """
+    if is_null_value(expr):
+        return []
+    assert expr is not None
+    text = expr.strip()
+
+    # Split on top-level commas (outside square brackets).
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch == "[":
+            depth += 1
+            current.append(ch)
+        elif ch == "]":
+            depth = max(0, depth - 1)
+            current.append(ch)
+        elif ch == "," and depth == 0:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+        else:
+            current.append(ch)
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    bracket_re = re.compile(r"^([^\[\]]*)\[([^\[\]]+)\](.*)$")
+
+    def _expand_item(item: str) -> list[str]:
+        match = bracket_re.match(item)
+        if not match:
+            return [normalize_node_name(item)] if item else []
+        prefix, inner, suffix = match.groups()
+        expanded_prefixes: list[str] = []
+        for range_tok in inner.split(","):
+            range_tok = range_tok.strip()
+            if not range_tok:
+                continue
+            if "-" in range_tok:
+                bounds = range_tok.split("-", 1)
+                start_s, end_s = bounds[0].strip(), bounds[1].strip()
+                if start_s.isdigit() and end_s.isdigit():
+                    width = len(start_s)
+                    start_i, end_i = int(start_s), int(end_s)
+                    if end_i >= start_i and (end_i - start_i) <= 10000:
+                        for num in range(start_i, end_i + 1):
+                            expanded_prefixes.append(f"{prefix}{num:0{width}d}")
+                    else:
+                        expanded_prefixes.append(f"{prefix}{range_tok}")
+                else:
+                    expanded_prefixes.append(f"{prefix}{range_tok}")
+            else:
+                expanded_prefixes.append(f"{prefix}{range_tok}")
+
+        out: list[str] = []
+        for pref in expanded_prefixes:
+            out.extend(_expand_item(f"{pref}{suffix}"))
+        return out
+
+    for part in parts:
+        for node in _expand_item(part):
+            if node and node not in seen:
+                seen.add(node)
+                result.append(node)
+
+    return result
+
+
+def format_memory_mb(memory_mb: int | None) -> str:
+    if memory_mb is None:
+        return "Unknown"
+    if memory_mb == 0:
+        return "0G"
+    if memory_mb % 1024 == 0:
+        return f"{memory_mb // 1024}G"
+    gb = memory_mb / 1024.0
+    if gb >= 10:
+        return f"{int(round(gb))}G"
+    if gb >= 1:
+        return f"{gb:.1f}G"
+    return f"{memory_mb}M"
+
+
+def format_duration_seconds(
+    seconds: int | None,
+    raw: str | None = None,
+    unlimited: bool = False,
+) -> str:
+    if unlimited or (raw and raw.strip().upper() in {"UNLIMITED", "INFINITE"}):
+        return "UNLIMITED"
+    if seconds is None:
+        return raw if (raw and not is_null_value(raw)) else "Unknown"
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if minutes == 0 and secs == 0 and hours > 0:
+        return f"{hours}h"
+    if hours >= 24 and seconds % 3600 == 0:
+        days, rem_h = divmod(hours, 24)
+        if rem_h == 0:
+            return f"{days}d ({hours}h)"
+        return f"{hours}h"
+    if secs == 0:
+        return f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def format_datetime(dt: datetime | None, raw: str | None = None) -> str:
+    if dt is not None:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    if raw and not is_null_value(raw):
+        return raw
+    return "Unknown"
+
+
+def is_compressed_array_job_id(job_id: str) -> bool:
+    """
+    Return True for compressed array job expressions like '34290337_[1406-1475%4]'.
+    """
+    return "[" in job_id or "]" in job_id or "%" in job_id
+
+
+# ============================================================================
+# 5. SLURM command execution
+# ============================================================================
+
+
+def validate_readonly_command(argv: list[str]) -> None:
+    """
+    Enforce the strict read-only SLURM operational boundary.
+    Raises ValueError if the command is not in the allowed read-only set.
+    """
+    if not argv:
+        raise ValueError("Empty command is not allowed.")
+
+    binary = argv[0].split("/")[-1].strip()
+
+    if binary in FORBIDDEN_COMMANDS:
+        raise ValueError(
+            f"Forbidden non-read-only SLURM command rejected: {binary}"
+        )
+
+    if binary == "scontrol":
+        for tok in argv[1:]:
+            if tok.lower() in FORBIDDEN_SCONTROL_SUBCOMMANDS:
+                raise ValueError(
+                    f"Forbidden scontrol operation rejected: scontrol {tok}"
+                )
+
+    normalized_head = (binary, *tuple(a.lower() for a in argv[1:]))
+    allowed = any(
+        normalized_head[: len(prefix)] == prefix
+        for prefix in ALLOWED_COMMAND_PREFIXES
+    )
+    if not allowed:
+        raise ValueError(
+            f"Command '{' '.join(argv)}' is outside the allowed read-only SLURM commands."
+        )
+
+
+def execute_slurm_command(
+    command: str | list[str],
+    timeout: float = 15.0,
+) -> CommandResult:
+    """
+    Validate and execute a read-only SLURM command, returning a CommandResult.
+    """
+    argv = shlex.split(command) if isinstance(command, str) else list(command)
+    validate_readonly_command(argv)
+
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return CommandResult(
+            command=argv,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            ok=(completed.returncode == 0),
+            error=(
+                completed.stderr.strip()
+                if completed.returncode != 0
+                else None
+            ),
+        )
+    except FileNotFoundError as exc:
+        return CommandResult(
+            command=argv,
+            returncode=127,
+            stdout="",
+            stderr=str(exc),
+            ok=False,
+            error=f"Command not found: {argv[0]}",
+        )
+    except subprocess.TimeoutExpired as exc:
+        return CommandResult(
+            command=argv,
+            returncode=124,
+            stdout=exc.stdout or "" if isinstance(exc.stdout, str) else "",
+            stderr=exc.stderr or "" if isinstance(exc.stderr, str) else "",
+            ok=False,
+            error=f"Command timed out after {timeout}s: {' '.join(argv)}",
+        )
+
+
+# ============================================================================
+# 6. raw parsers
+# ============================================================================
+
+_MEM_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s*([KMGTPE]?)(?:I?B)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_memory(value: str | None) -> int | None:
+    """
+    Parse a SLURM memory string into normalized integer MiB (MB).
+
+    Supports suffixes K, M, G, T (case-insensitive) and bare integers
+    (which SLURM uses for MiB in RealMemory, AllocMem, etc.).
+    Returns None on missing, unknown, or unparseable values.
+    Never returns a fake 0 on parse failure.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if is_null_value(stripped):
+        return None
+    if stripped.upper() in {"UNLIMITED", "INFINITE", "NONE"}:
+        return None
+
+    match = _MEM_RE.match(stripped)
+    if not match:
+        return None
+
+    amount_str, unit = match.groups()
+    try:
+        amount = float(amount_str)
+    except ValueError:
+        return None
+
+    if amount < 0:
+        return None
+
+    unit_u = unit.upper()
+    if unit_u in ("", "M"):
+        return int(round(amount))
+    if unit_u == "K":
+        if amount == 0:
+            return 0
+        return max(1, int(round(amount / 1024.0)))
+    if unit_u == "G":
+        return int(round(amount * 1024.0))
+    if unit_u == "T":
+        return int(round(amount * 1024.0 * 1024.0))
+    if unit_u == "P":
+        return int(round(amount * 1024.0 * 1024.0 * 1024.0))
+    return None
+
+
+def is_unlimited_duration(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().upper() in {"UNLIMITED", "INFINITE"}
+
+
+def parse_duration(value: str | None) -> int | None:
+    """
+    Parse a SLURM duration string into total integer seconds.
+
+    Supported formats:
+        MM:SS
+        HH:MM:SS
+        D-HH:MM:SS
+        D-HH:MM
+        D-HH
+        UNLIMITED / N/A / Unknown -> None
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if is_null_value(stripped) or is_unlimited_duration(stripped):
+        return None
+
+    days = 0
+    time_part = stripped
+    if "-" in stripped:
+        day_str, time_part = stripped.split("-", 1)
+        if not day_str.isdigit():
+            return None
+        days = int(day_str)
+
+    segments = time_part.split(":")
+    if not all(seg.isdigit() for seg in segments):
+        return None
+
+    if len(segments) == 1:
+        if "-" in stripped:
+            # D-HH
+            hours = int(segments[0])
+            return days * 86400 + hours * 3600
+        # Bare minutes
+        minutes = int(segments[0])
+        return minutes * 60
+
+    if len(segments) == 2:
+        if "-" in stripped:
+            # D-HH:MM
+            hours, minutes = int(segments[0]), int(segments[1])
+            if minutes >= 60:
+                return None
+            return days * 86400 + hours * 3600 + minutes * 60
+        # MM:SS
+        minutes, seconds = int(segments[0]), int(segments[1])
+        if seconds >= 60:
+            return None
+        return minutes * 60 + seconds
+
+    if len(segments) == 3:
+        hours, minutes, seconds = (
+            int(segments[0]),
+            int(segments[1]),
+            int(segments[2]),
+        )
+        if minutes >= 60 or seconds >= 60:
+            return None
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+    return None
+
+
+def parse_slurm_datetime(value: str | None) -> datetime | None:
+    """
+    Parse a SLURM datetime string such as '2026-11-04T19:42:29' into a datetime.
+    Returns None for Unknown, None, N/A, (null), or invalid timestamps.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if is_null_value(stripped):
+        return None
+
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(stripped, fmt)
+        except ValueError:
+            continue
+
+    try:
+        return datetime.fromisoformat(stripped)
+    except ValueError:
+        return None
+
+
+def parse_tres(tres_string: str | None) -> dict[str, Any]:
+    """
+    Parse a SLURM TRES string (e.g., 'cpu=12,mem=144G,node=1,billing=90,gres/gpu=1').
+
+    Returns a normalized dictionary:
+        {
+            "cpu": int | None,
+            "mem_mb": int | None,
+            "mem_raw": str | None,
+            "node": int | None,
+            "billing": int | None,
+            "gpu_count": int,
+            "gpu_type": str | None,
+            "entries": dict[str, str],
+        }
+    """
+    result: dict[str, Any] = {
+        "cpu": None,
+        "mem_mb": None,
+        "mem_raw": None,
+        "node": None,
+        "billing": None,
+        "gpu_count": 0,
+        "gpu_type": None,
+        "entries": {},
+    }
+    if is_null_value(tres_string):
+        return result
+
+    assert tres_string is not None
+    generic_gpu_count: int | None = None
+    typed_gpu_counts: dict[str, int] = {}
+
+    for part in tres_string.strip().split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        result["entries"][key] = val
+
+        key_lower = key.lower()
+        if key_lower == "cpu":
+            if val.isdigit():
+                result["cpu"] = int(val)
+        elif key_lower == "mem":
+            result["mem_raw"] = val
+            result["mem_mb"] = parse_memory(val)
+        elif key_lower == "node":
+            if val.isdigit():
+                result["node"] = int(val)
+        elif key_lower == "billing":
+            if val.isdigit():
+                result["billing"] = int(val)
+        elif key_lower == "gres/gpu":
+            if val.isdigit():
+                generic_gpu_count = int(val)
+        elif key_lower.startswith("gres/gpu:"):
+            gtype = key.split(":", 1)[1].strip()
+            if val.isdigit():
+                typed_gpu_counts[gtype] = int(val)
+            elif gtype:
+                result["gpu_type"] = gtype
+
+    if typed_gpu_counts:
+        # Preserve GPU type from typed TRES entry
+        first_type = next(iter(typed_gpu_counts.keys()))
+        result["gpu_type"] = first_type
+        if generic_gpu_count is not None:
+            result["gpu_count"] = generic_gpu_count
+        else:
+            result["gpu_count"] = sum(typed_gpu_counts.values())
+    elif generic_gpu_count is not None:
+        result["gpu_count"] = generic_gpu_count
+
+    return result
+
+
+def parse_state_flags(state_string: str | None) -> set[str]:
+    """
+    Parse a SLURM node state string such as 'IDLE+DRAIN' or
+    'DOWN+DRAIN+NOT_RESPONDING' into normalized uppercase flag tokens.
+
+    Trailing SLURM state symbols (*, ~, #, $, @, -, %) are stripped from
+    individual tokens while preserving all state words.
+    """
+    if is_null_value(state_string):
+        return set()
+    assert state_string is not None
+    flags: set[str] = set()
+    for raw_tok in re.split(r"[+,|\s]+", state_string.strip()):
+        cleaned = raw_tok.strip().rstrip("*~#$@-%").upper()
+        if cleaned:
+            flags.add(cleaned)
+    return flags
+
+
+_KV_KEY_RE = re.compile(r"(?<!\S)([A-Za-z0-9_/:.-]+)=")
+
+
+def parse_scontrol_kv_block(block: str) -> dict[str, str]:
+    """
+    Parse a single-record block from `scontrol show <entity>` into a dictionary
+    of key -> raw value string, preserving full node/job reasons and TRES fields.
+    """
+    fields: dict[str, str] = {}
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        # In `scontrol show node`, Reason=... occupies the remainder of the line
+        # and may contain brackets, timestamps, or '=' signs.
+        if line.startswith("Reason=") and "JobState=" not in line:
+            fields["Reason"] = line[len("Reason=") :].strip()
+            continue
+
+        matches = list(_KV_KEY_RE.finditer(line))
+        for idx, match in enumerate(matches):
+            key = match.group(1)
+            val_start = match.end()
+            val_end = (
+                matches[idx + 1].start()
+                if idx + 1 < len(matches)
+                else len(line)
+            )
+            value = line[val_start:val_end].strip()
+            fields[key] = value
+    return fields
+
+
+def parse_scontrol_blocks(output: str) -> list[dict[str, str]]:
+    """
+    Split multi-record `scontrol show` output into blocks and parse each block.
+    """
+    if not output or not output.strip():
+        return []
+
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    record_Start_Prefixes = (
+        "JobId=",
+        "NodeName=",
+        "PartitionName=",
+        "ReservationName=",
+    )
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        if current and any(
+            stripped.startswith(pref) for pref in record_Start_Prefixes
+        ):
+            blocks.append(current)
+            current = [line]
+        else:
+            current.append(line)
+
+    if current:
+        blocks.append(current)
+
+    parsed: list[dict[str, str]] = []
+    for blk in blocks:
+        kv = parse_scontrol_kv_block("\n".join(blk))
+        if kv:
+            parsed.append(kv)
+    return parsed
+
+
+# ============================================================================
+# 7. normalization helpers
+# ============================================================================
+
+
+def _parse_gres_spec(gres_raw: str | None) -> tuple[int | None, str | None]:
+    """
+    Parse a SLURM Gres / TresPerNode specification such as:
+        'gpu:a100-pcie-80gb:4'
+        'gpu:a100:2(S:0-1)'
+        'gres/gpu:a100:2'
+        'gres/gpu:1'
+        'gpu:4'
+    Returns (gpu_count, gpu_type).
+    """
+    if is_null_value(gres_raw):
+        return None, None
+    assert gres_raw is not None
+
+    for item in gres_raw.strip().split(","):
+        # Remove parenthetical socket/index annotations like (IDX:0-3) or (S:0)
+        cleaned = re.sub(r"\([^)]*\)", "", item).strip()
+        if not cleaned:
+            continue
+        if cleaned.lower().startswith("gres/"):
+            cleaned = cleaned[5:]
+        if not cleaned.lower().startswith("gpu"):
+            continue
+        parts = cleaned.split(":")
+        # 'gpu' alone
+        if len(parts) == 1:
+            return 1, None
+        # 'gpu:4' or 'gpu:a100'
+        if len(parts) == 2:
+            if parts[1].isdigit():
+                return int(parts[1]), None
+            return 1, parts[1] or None
+        # 'gpu:a100-pcie-80gb:4'
+        if len(parts) >= 3:
+            gtype = parts[1].strip() or None
+            count_str = parts[2].strip()
+            count = int(count_str) if count_str.isdigit() else None
+            return count, gtype
+
+    return None, None
+
+
+def _parse_constraints(features_raw: str | None) -> set[str]:
+    if is_null_value(features_raw):
+        return set()
+    assert features_raw is not None
+    tokens: set[str] = set()
+    for tok in re.split(r"[&|,\s()\[\]]+", features_raw.strip()):
+        cleaned = tok.strip()
+        if cleaned and not is_null_value(cleaned):
+            tokens.add(cleaned.lower())
+    return tokens
+
+
+def parse_job_info(text_or_fields: str | dict[str, str]) -> JobInfo:
+    """
+    Normalize a `scontrol show job` record into a JobInfo object.
+    """
+    if isinstance(text_or_fields, str):
+        blocks = parse_scontrol_blocks(text_or_fields)
+        fields = blocks[0] if blocks else parse_scontrol_kv_block(text_or_fields)
+    else:
+        fields = dict(text_or_fields)
+
+    job_id = str(fields.get("JobId", "")).strip()
+    name = fields.get("JobName", fields.get("Name", "")).strip()
+
+    user_raw = fields.get("UserId", "").strip()
+    user = user_raw.split("(", 1)[0].strip() if user_raw else ""
+
+    account = fields.get("Account", "").strip()
+    qos = fields.get("QOS", fields.get("QoS", "")).strip()
+    partition = fields.get("Partition", "").strip()
+    state = fields.get("JobState", "").strip()
+    reason = fields.get("Reason", "").strip()
+
+    prio_raw = fields.get("Priority", "").strip()
+    priority = int(prio_raw) if prio_raw.isdigit() else None
+
+    submit_raw = fields.get("SubmitTime")
+    start_raw = fields.get("StartTime")
+    end_raw = fields.get("EndTime")
+    run_time_raw = fields.get("RunTime")
+    time_limit_raw = fields.get("TimeLimit")
+
+    req_tres_raw = fields.get("ReqTRES")
+    alloc_tres_raw = fields.get("AllocTRES")
+
+    req_tres = parse_tres(req_tres_raw)
+    alloc_tres = parse_tres(alloc_tres_raw)
+
+    # Nodes count
+    nodes_count = 1
+    num_nodes_raw = fields.get("NumNodes", "").strip()
+    if num_nodes_raw:
+        first_num = num_nodes_raw.split("-", 1)[0].strip()
+        if first_num.isdigit():
+            nodes_count = int(first_num)
+    elif req_tres["node"] is not None:
+        nodes_count = req_tres["node"]
+
+    # CPUs
+    cpus: int | None = req_tres["cpu"]
+    if cpus is None:
+        num_cpus_raw = fields.get("NumCPUs", "").strip()
+        if num_cpus_raw.isdigit():
+            cpus = int(num_cpus_raw)
+        elif alloc_tres["cpu"] is not None:
+            cpus = alloc_tres["cpu"]
+
+    # Memory semantics (Section 14):
+    # Prefer total memory from ReqTRES mem= when available.
+    min_mem_node_raw = fields.get("MinMemoryNode")
+    min_mem_cpu_raw = fields.get("MinMemoryCPU")
+    min_mem_tres_raw = fields.get("MinMemoryTRES")
+
+    memory_mb: int | None = req_tres["mem_mb"]
+    memory_raw: str | None = req_tres["mem_raw"]
+
+    if memory_mb is None and alloc_tres["mem_mb"] is not None:
+        memory_mb = alloc_tres["mem_mb"]
+        memory_raw = alloc_tres["mem_raw"]
+
+    if memory_mb is None:
+        if not is_null_value(min_mem_node_raw):
+            memory_mb = parse_memory(min_mem_node_raw)
+            memory_raw = min_mem_node_raw
+        elif not is_null_value(min_mem_cpu_raw) and cpus is not None:
+            per_cpu = parse_memory(min_mem_cpu_raw)
+            if per_cpu is not None:
+                memory_mb = per_cpu * cpus
+                memory_raw = f"{min_mem_cpu_raw}/cpu"
+
+    # GPU semantics (Section 15):
+    gpu_count = req_tres["gpu_count"]
+    gpu_type = req_tres["gpu_type"]
+
+    for gres_field in ("TresPerNode", "ReqGres", "Gres"):
+        gres_val = fields.get(gres_field)
+        if not is_null_value(gres_val):
+            g_cnt, g_type = _parse_gres_spec(gres_val)
+            if gpu_count == 0 and g_cnt is not None:
+                gpu_count = g_cnt
+            if gpu_type is None and g_type is not None:
+                gpu_type = g_type
+
+    if gpu_count == 0 and alloc_tres["gpu_count"] > 0:
+        gpu_count = alloc_tres["gpu_count"]
+        if gpu_type is None:
+            gpu_type = alloc_tres["gpu_type"]
+
+    # If still no memory_mb and MinMemoryTRES is present with GPUs
+    if memory_mb is None and not is_null_value(min_mem_tres_raw) and gpu_count > 0:
+        per_gpu = parse_memory(min_mem_tres_raw)
+        if per_gpu is not None:
+            memory_mb = per_gpu * gpu_count
+            memory_raw = min_mem_tres_raw
+
+    req_nodes_raw = fields.get("ReqNodeList")
+    exc_nodes_raw = fields.get("ExcNodeList")
+    features_raw = fields.get("Features")
+
+    request = ResourceRequest(
+        cpus=cpus,
+        memory_mb=memory_mb,
+        memory_raw=memory_raw,
+        nodes=nodes_count,
+        gpu_count=gpu_count,
+        gpu_type=gpu_type,
+        time_limit_seconds=parse_duration(time_limit_raw),
+        time_limit_raw=time_limit_raw,
+        time_limit_unlimited=is_unlimited_duration(time_limit_raw),
+        constraints=_parse_constraints(features_raw),
+        constraints_raw=None if is_null_value(features_raw) else features_raw,
+        req_nodes=set(expand_nodelist(req_nodes_raw)),
+        req_nodes_raw=None if is_null_value(req_nodes_raw) else req_nodes_raw,
+        exc_nodes=set(expand_nodelist(exc_nodes_raw)),
+        exc_nodes_raw=None if is_null_value(exc_nodes_raw) else exc_nodes_raw,
+        min_memory_node_raw=(
+            None if is_null_value(min_mem_node_raw) else min_mem_node_raw
+        ),
+        min_memory_cpu_raw=(
+            None if is_null_value(min_mem_cpu_raw) else min_mem_cpu_raw
+        ),
+        min_memory_tres_raw=(
+            None if is_null_value(min_mem_tres_raw) else min_mem_tres_raw
+        ),
+    )
+
+    node_list_raw = fields.get("NodeList")
+    sched_node_list_raw = fields.get("SchedNodeList")
+    dep_raw = fields.get("Dependency")
+    dependency_raw = None if is_null_value(dep_raw) else dep_raw.strip()
+
+    allocated_gpus: int | None = None
+    allocated_gpu_type: str | None = None
+    allocated_cpus: int | None = None
+    allocated_memory_mb: int | None = None
+    if alloc_tres["entries"]:
+        allocated_gpus = alloc_tres["gpu_count"]
+        allocated_gpu_type = alloc_tres["gpu_type"] or gpu_type
+        allocated_cpus = alloc_tres["cpu"]
+        allocated_memory_mb = alloc_tres["mem_mb"]
+
+    return JobInfo(
+        job_id=job_id,
+        name=name,
+        user=user,
+        account=account,
+        qos=qos,
+        partition=partition,
+        partitions=parse_partition_list(partition),
+        state=state,
+        reason=reason,
+        priority=priority,
+        submit_time=parse_slurm_datetime(submit_raw),
+        submit_time_raw=submit_raw,
+        start_time=parse_slurm_datetime(start_raw),
+        start_time_raw=start_raw,
+        end_time=parse_slurm_datetime(end_raw),
+        end_time_raw=end_raw,
+        run_time_seconds=parse_duration(run_time_raw),
+        run_time_raw=run_time_raw,
+        node_list=expand_nodelist(node_list_raw),
+        node_list_raw=None if is_null_value(node_list_raw) else node_list_raw,
+        sched_node_list=expand_nodelist(sched_node_list_raw),
+        sched_node_list_raw=(
+            None if is_null_value(sched_node_list_raw) else sched_node_list_raw
+        ),
+        dependency_raw=dependency_raw,
+        req_tres_raw=req_tres_raw,
+        alloc_tres_raw=alloc_tres_raw,
+        allocated_gpus=allocated_gpus,
+        allocated_gpu_type=allocated_gpu_type,
+        allocated_cpus=allocated_cpus,
+        allocated_memory_mb=allocated_memory_mb,
+        request=request,
+        raw_fields=fields,
+    )
+
+
+def parse_node_info(text_or_fields: str | dict[str, str]) -> NodeInfo:
+    """
+    Normalize a single `scontrol show node` record into a NodeInfo object.
+
+    Preserves complete node states (including +DRAIN, +PLANNED, etc.) and uses
+    Tri-state / None on parse failures rather than fake zeros.
+    """
+    if isinstance(text_or_fields, str):
+        blocks = parse_scontrol_blocks(text_or_fields)
+        fields = blocks[0] if blocks else parse_scontrol_kv_block(text_or_fields)
+    else:
+        fields = dict(text_or_fields)
+
+    raw_name = fields.get("NodeName", "")
+    name = normalize_node_name(raw_name)
+
+    state_raw = fields.get("State", "UNKNOWN").strip() or "UNKNOWN"
+    state_flags = parse_state_flags(state_raw)
+
+    reason_raw = fields.get("Reason")
+    reason = None if is_null_value(reason_raw) else reason_raw
+
+    partitions_raw = fields.get("Partitions", "")
+    partitions = {
+        p.strip()
+        for p in partitions_raw.split(",")
+        if p.strip() and not is_null_value(p)
+    }
+
+    cpu_tot_raw = fields.get("CPUTot")
+    cpu_alloc_raw = fields.get("CPUAlloc")
+    cpu_load_raw = fields.get("CPULoad")
+
+    cpu_total = (
+        int(cpu_tot_raw.strip())
+        if cpu_tot_raw is not None and cpu_tot_raw.strip().isdigit()
+        else None
+    )
+    cpu_alloc = (
+        int(cpu_alloc_raw.strip())
+        if cpu_alloc_raw is not None and cpu_alloc_raw.strip().isdigit()
+        else None
+    )
+
+    cpu_load: float | None = None
+    if cpu_load_raw is not None and not is_null_value(cpu_load_raw):
+        try:
+            cpu_load = float(cpu_load_raw.strip())
+        except ValueError:
+            cpu_load = None
+
+    real_mem_raw = fields.get("RealMemory")
+    alloc_mem_raw = fields.get("AllocMem")
+    memory_total_mb = parse_memory(real_mem_raw)
+    memory_alloc_mb = parse_memory(alloc_mem_raw)
+
+    gres_raw = fields.get("Gres")
+    cfg_tres_raw = fields.get("CfgTRES")
+    alloc_tres_raw = fields.get("AllocTRES")
+
+    gres_count, gres_type = _parse_gres_spec(gres_raw)
+    cfg_tres = parse_tres(cfg_tres_raw)
+    alloc_tres = parse_tres(alloc_tres_raw)
+
+    gpu_type = gres_type or cfg_tres["gpu_type"] or alloc_tres["gpu_type"]
+
+    # Derive gpu_total, gpu_allocated, gpu_free
+    gpu_total: int | None = None
+    if cfg_tres_raw is not None and not is_null_value(cfg_tres_raw):
+        if cfg_tres["entries"]:
+            gpu_total = cfg_tres["gpu_count"]
+    elif gres_count is not None:
+        gpu_total = gres_count
+    elif gres_raw is not None and gres_raw.strip().lower() in {"(null)", "none"}:
+        gpu_total = 0
+
+    gpu_allocated: int | None = None
+    if "AllocTRES" in fields:
+        # Note: on IDLE nodes in SLURM, 'AllocTRES=' is empty, meaning 0 allocated TRES.
+        raw_at = fields["AllocTRES"].strip()
+        if raw_at == "" or raw_at.lower() in {"(null)", "none"}:
+            gpu_allocated = 0
+        elif alloc_tres["entries"]:
+            gpu_allocated = alloc_tres["gpu_count"]
+    elif gpu_total == 0:
+        gpu_allocated = 0
+
+    gpu_free: int | None = None
+    if gpu_total is not None and gpu_allocated is not None:
+        gpu_free = max(0, gpu_total - gpu_allocated)
+
+    features: set[str] = set()
+    for feat_key in ("ActiveFeatures", "AvailableFeatures", "Features"):
+        f_raw = fields.get(feat_key)
+        if not is_null_value(f_raw):
+            assert f_raw is not None
+            for tok in f_raw.split(","):
+                tok_clean = tok.strip().lower()
+                if tok_clean:
+                    features.add(tok_clean)
+
+    return NodeInfo(
+        name=name,
+        state_raw=state_raw,
+        state_flags=state_flags,
+        reason=reason,
+        partitions=partitions,
+        cpu_total=cpu_total,
+        cpu_alloc=cpu_alloc,
+        cpu_load=cpu_load,
+        cpu_load_raw=cpu_load_raw,
+        memory_total_mb=memory_total_mb,
+        memory_alloc_mb=memory_alloc_mb,
+        gpu_total=gpu_total,
+        gpu_allocated=gpu_allocated,
+        gpu_free=gpu_free,
+        gpu_type=gpu_type,
+        gres_raw=gres_raw,
+        cfg_tres_raw=cfg_tres_raw,
+        alloc_tres_raw=alloc_tres_raw,
+        features=features,
+        raw_fields=fields,
+    )
+
+
+def parse_nodes_output(output: str) -> dict[str, NodeInfo]:
+    nodes: dict[str, NodeInfo] = {}
+    for block_fields in parse_scontrol_blocks(output):
+        if "NodeName" not in block_fields:
+            continue
+        node = parse_node_info(block_fields)
+        if node.name:
+            nodes[node.name] = node
+    return nodes
+
+
+def _parse_policy_set(raw: str | None) -> set[str] | None:
+    if is_null_value(raw):
+        return None
+    assert raw is not None
+    items = {
+        tok.strip().lower()
+        for tok in raw.split(",")
+        if tok.strip() and not is_null_value(tok)
+    }
+    if not items:
+        return None
+    if "all" in items:
+        return {"ALL"}
+    return items
+
+
+def parse_partition_info(text_or_fields: str | dict[str, str]) -> PartitionInfo:
+    """
+    Normalize `scontrol show partition` output into a PartitionInfo object.
+    """
+    if isinstance(text_or_fields, str):
+        blocks = parse_scontrol_blocks(text_or_fields)
+        fields = blocks[0] if blocks else parse_scontrol_kv_block(text_or_fields)
+    else:
+        fields = dict(text_or_fields)
+
+    name = fields.get("PartitionName", "").strip()
+    state = fields.get("State", "UP").strip()
+    max_time_raw = fields.get("MaxTime")
+    max_time_unlimited = is_unlimited_duration(max_time_raw)
+    max_time_seconds = parse_duration(max_time_raw)
+
+    max_nodes_raw = fields.get("MaxNodes", "").strip()
+    max_nodes = int(max_nodes_raw) if max_nodes_raw.isdigit() else None
+
+    max_cpus_raw = fields.get("MaxCPUsPerNode", "").strip()
+    max_cpus_per_node = int(max_cpus_raw) if max_cpus_raw.isdigit() else None
+
+    max_mem_raw = fields.get("MaxMemPerNode")
+    max_mem_per_node_mb = parse_memory(max_mem_raw)
+
+    allow_accounts = _parse_policy_set(fields.get("AllowAccounts"))
+    deny_accounts_set = _parse_policy_set(fields.get("DenyAccounts")) or set()
+    deny_accounts = (
+        set() if "ALL" in deny_accounts_set else deny_accounts_set
+    )
+
+    allow_qos = _parse_policy_set(fields.get("AllowQos", fields.get("AllowQOS")))
+    deny_qos_set = (
+        _parse_policy_set(fields.get("DenyQos", fields.get("DenyQOS"))) or set()
+    )
+    deny_qos = set() if "ALL" in deny_qos_set else deny_qos_set
+
+    nodes_raw = fields.get("Nodes")
+    nodes = expand_nodelist(nodes_raw)
+    qos = fields.get("QoS", fields.get("QOS"))
+
+    return PartitionInfo(
+        name=name,
+        state=state,
+        max_time_seconds=max_time_seconds,
+        max_time_raw=max_time_raw,
+        max_time_unlimited=max_time_unlimited,
+        max_nodes=max_nodes,
+        max_cpus_per_node=max_cpus_per_node,
+        max_mem_per_node_mb=max_mem_per_node_mb,
+        allow_accounts=allow_accounts,
+        deny_accounts=deny_accounts,
+        allow_qos=allow_qos,
+        deny_qos=deny_qos,
+        nodes=nodes,
+        nodes_raw=nodes_raw,
+        qos=None if is_null_value(qos) else qos,
+        raw_fields=fields,
+    )
+
+
+def parse_reservation_info(
+    text_or_fields: str | dict[str, str]
+) -> ReservationInfo:
+    """
+    Normalize a single `scontrol show reservation` record into a ReservationInfo.
+    """
+    if isinstance(text_or_fields, str):
+        blocks = parse_scontrol_blocks(text_or_fields)
+        fields = blocks[0] if blocks else parse_scontrol_kv_block(text_or_fields)
+    else:
+        fields = dict(text_or_fields)
+
+    name = fields.get("ReservationName", "").strip()
+    start_raw = fields.get("StartTime")
+    end_raw = fields.get("EndTime")
+    nodes_raw = fields.get("Nodes")
+    state = fields.get("State", "").strip()
+
+    flags_raw = fields.get("Flags", "")
+    flags = (
+        {
+            f.strip().upper()
+            for f in flags_raw.split(",")
+            if f.strip() and not is_null_value(f)
+        }
+        if not is_null_value(flags_raw)
+        else set()
+    )
+
+    users_raw = fields.get("Users", "")
+    users = (
+        {
+            u.strip().lower()
+            for u in users_raw.split(",")
+            if u.strip() and not is_null_value(u)
+        }
+        if not is_null_value(users_raw)
+        else set()
+    )
+
+    accounts_raw = fields.get("Accounts", "")
+    accounts = (
+        {
+            a.strip().lower()
+            for a in accounts_raw.split(",")
+            if a.strip() and not is_null_value(a)
+        }
+        if not is_null_value(accounts_raw)
+        else set()
+    )
+
+    part_raw = fields.get("PartitionName")
+    partition = None if is_null_value(part_raw) else part_raw
+
+    return ReservationInfo(
+        name=name,
+        start_time=parse_slurm_datetime(start_raw),
+        end_time=parse_slurm_datetime(end_raw),
+        start_time_raw=start_raw,
+        end_time_raw=end_raw,
+        nodes=set(expand_nodelist(nodes_raw)),
+        nodes_raw=nodes_raw,
+        state=state,
+        flags=flags,
+        users=users,
+        accounts=accounts,
+        partition=partition,
+        tres_raw=fields.get("TRES"),
+        raw_fields=fields,
+    )
+
+
+def parse_reservations_output(output: str) -> list[ReservationInfo]:
+    reservations: list[ReservationInfo] = []
+    for block_fields in parse_scontrol_blocks(output):
+        if "ReservationName" not in block_fields:
+            continue
+        resv = parse_reservation_info(block_fields)
+        if resv.name:
+            reservations.append(resv)
+    return reservations
+
+
+def parse_priority_info(output: str, target_job_id: str = "") -> PriorityInfo | None:
+    """
+    Parse `sprio -j JOBID` tabular output into PriorityInfo.
+    """
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    headers: list[str] = []
+    for line in lines:
+        tokens = line.split()
+        if not tokens:
+            continue
+        if tokens[0].upper() == "JOBID":
+            headers = [t.upper() for t in tokens]
+            continue
+        if headers and len(tokens) == len(headers):
+            row = dict(zip(headers, tokens))
+        elif len(tokens) >= 3 and tokens[0].isdigit():
+            # Fallback positional: JOBID PARTITION PRIORITY [SITE] [AGE] [FAIRSHARE] [QOS]
+            cols = ["JOBID", "PARTITION", "PRIORITY", "SITE", "AGE", "FAIRSHARE", "QOS"]
+            row = dict(zip(cols[: len(tokens)], tokens))
+        else:
+            continue
+
+        jid = row.get("JOBID", "").strip()
+        if target_job_id and jid and jid != target_job_id:
+            continue
+
+        def _to_int(key: str) -> int | None:
+            v = row.get(key, "").strip()
+            return int(v) if v.lstrip("-").isdigit() else None
+
+        return PriorityInfo(
+            job_id=jid or target_job_id,
+            partition=row.get("PARTITION", ""),
+            priority=_to_int("PRIORITY"),
+            site=_to_int("SITE"),
+            age=_to_int("AGE"),
+            fairshare=_to_int("FAIRSHARE"),
+            qos=_to_int("QOS"),
+            raw_fields=row,
+        )
+
+    return None
+
+
+def parse_sinfo_nodes(output: str) -> list[str]:
+    """
+    Parse `sinfo -p PARTITION -N` output (with or without header) into a list
+    of unique normalized node names.
+    """
+    nodes: list[str] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        tokens = stripped.split()
+        first = tokens[0]
+        if first.upper() in {"NODELIST", "NODE", "HOSTNAMES"}:
+            continue
+        for node in expand_nodelist(first):
+            if node and node not in seen:
+                seen.add(node)
+                nodes.append(node)
+    return nodes
+
+
+def parse_squeue_start(output: str, target_job_id: str = "") -> dict[str, str]:
+    """
+    Parse `squeue --start -j JOBID` output into a dict with keys
+    'start_time' and 'sched_nodes' when available.
+    """
+    info: dict[str, str] = {}
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    for line in lines:
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            if parts[0].upper() == "JOBID":
+                continue
+            if len(parts) >= 3:
+                jid, start_str, sched_nodes = parts[0], parts[1], parts[2]
+                if not target_job_id or jid == target_job_id:
+                    info["job_id"] = jid
+                    info["start_time"] = start_str
+                    info["sched_nodes"] = sched_nodes
+                    if len(parts) >= 4:
+                        info["reason"] = parts[3]
+                    return info
+        else:
+            tokens = line.split()
+            if not tokens or tokens[0].upper() == "JOBID":
+                continue
+            # Standard `squeue --start`:
+            # JOBID PARTITION NAME USER ST START_TIME NODES SCHEDNODES NODELIST(REASON)
+            if len(tokens) >= 8:
+                jid = tokens[0]
+                if not target_job_id or jid == target_job_id:
+                    info["job_id"] = jid
+                    info["start_time"] = tokens[5]
+                    info["sched_nodes"] = tokens[7]
+                    if len(tokens) >= 9:
+                        info["reason"] = " ".join(tokens[8:])
+                    return info
+    return info
+
+
+def parse_squeue_pending(
+    output: str,
+    target_job_id: str = "",
+) -> tuple[list[dict[str, str]], list[str], dict[str, int]]:
+    """
+    Parse `squeue -p PARTITION -t PENDING` output (either pipe-delimited or
+    standard tabular format).
+
+    Returns:
+        (inspectable_entries, skipped_array_job_ids, reason_counts)
+    """
+    inspectable: list[dict[str, str]] = []
+    skipped_arrays: list[str] = []
+    reason_counts: dict[str, int] = {}
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            if parts[0].upper() == "JOBID":
+                continue
+            jid = parts[0]
+            prio_s = parts[1] if len(parts) > 1 else ""
+            user = parts[2] if len(parts) > 2 else ""
+            name = parts[3] if len(parts) > 3 else ""
+            reason = parts[4].strip("()") if len(parts) > 4 else ""
+            start_t = parts[5] if len(parts) > 5 else ""
+            sched_n = parts[6] if len(parts) > 6 else ""
+        else:
+            tokens = line.split()
+            if not tokens or tokens[0].upper() == "JOBID":
+                continue
+            jid = tokens[0]
+            prio_s = ""
+            name = tokens[2] if len(tokens) > 2 else ""
+            user = tokens[3] if len(tokens) > 3 else ""
+            reason_raw = tokens[-1] if len(tokens) >= 8 else ""
+            reason = reason_raw.strip("()") if reason_raw.startswith("(") else ""
+            start_t = ""
+            sched_n = ""
+
+        if reason:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        if jid == target_job_id:
+            continue
+
+        if is_compressed_array_job_id(jid):
+            skipped_arrays.append(jid)
+            continue
+
+        if jid.isdigit() or re.fullmatch(r"\d+_\d+", jid):
+            inspectable.append(
+                {
+                    "job_id": jid,
+                    "priority": prio_s,
+                    "user": user,
+                    "name": name,
+                    "reason": reason,
+                    "start_time": start_t,
+                    "sched_nodes": sched_n,
+                }
+            )
+        else:
+            skipped_arrays.append(jid)
+
+    return inspectable, skipped_arrays, reason_counts
+
+
+def parse_sacctmgr_accounts(output: str) -> dict[str, str]:
+    """
+    Parse `sacctmgr show account ... format=Account,ParentName -n -p`
+    pipe-delimited output (`Account|ParentName|`) into a mapping of
+    child_account_lower -> parent_account_lower.
+
+    Empty ParentName fields (e.g. `immune-rep.prj||`) and self-referential
+    entries (`acct == parent`) are ignored so unavailable or incomplete
+    hierarchy data is never treated as a valid parent chain.
+    """
+    parent_map: dict[str, str] = {}
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = [p.strip() for p in stripped.split("|")]
+        if parts and parts[-1] == "":
+            parts = parts[:-1]
+        if len(parts) == 2:
+            acct = parts[0].lower()
+            parent = parts[1].lower()
+        elif len(parts) >= 3:
+            acct = parts[0].lower()
+            parent = parts[2].lower() if parts[2] else parts[1].lower()
+        else:
+            continue
+        if acct == "account" and parent in {"parentname", "parent", "org", "descr"}:
+            continue
+        if acct and parent and parent != acct and not is_null_value(parent):
+            parent_map[acct] = parent
+    return parent_map
+
+
+def resolve_account_ancestors(
+    account: str,
+    parent_map: dict[str, str],
+) -> set[str]:
+    """
+    Return candidate account identifiers for `account`:
+        - exact lowercased account name
+        - proven ancestors reachable via `parent_map`
+
+    Does not infer parent accounts from string suffixes (such as '.prj').
+    """
+    if is_null_value(account):
+        return set()
+    acct_low = account.strip().lower()
+    candidates: set[str] = {acct_low}
+
+    curr = acct_low
+    visited: set[str] = set()
+    while curr and curr not in visited:
+        visited.add(curr)
+        parent = parent_map.get(curr, "").strip().lower()
+        if parent and not is_null_value(parent) and parent != curr:
+            candidates.add(parent)
+            curr = parent
+        else:
+            break
+    return candidates
+
+
+_FAILED_DEP_TOKEN_RE = re.compile(r"\(\s*failed\s*\)", re.IGNORECASE)
+
+
+def find_failed_dependencies(dependency_raw: str | None) -> list[str]:
+    """
+    Inspect a SLURM Dependency= expression and return any individual
+    dependency clauses that explicitly report a `(failed)` state
+    (e.g. `afterok:34360405(failed)`).
+
+    Never classifies `(unfulfilled)` or other non-failed states as failed.
+    """
+    if is_null_value(dependency_raw):
+        return []
+    assert dependency_raw is not None
+    failed_clauses: list[str] = []
+    for clause in re.split(r"[,?]+", dependency_raw.strip()):
+        tok = clause.strip()
+        if tok and _FAILED_DEP_TOKEN_RE.search(tok):
+            failed_clauses.append(tok)
+    return failed_clauses
+
+
+# ============================================================================
+# 8. acquisition functions
+# ============================================================================
+
+CommandRunner = Callable[[str | list[str]], CommandResult]
+
+
+def compare_job_snapshots(job_a: JobInfo, job_b: JobInfo) -> list[str]:
+    """
+    Compare scheduling-relevant fields between two snapshots of the target job.
+    Returns the list of SLURM field names that changed.
+    """
+    changed: list[str] = []
+    mapping = {
+        "JobState": (job_a.state, job_b.state),
+        "Reason": (job_a.reason, job_b.reason),
+        "StartTime": (job_a.start_time_raw, job_b.start_time_raw),
+        "SchedNodeList": (job_a.sched_node_list_raw, job_b.sched_node_list_raw),
+        "NodeList": (job_a.node_list_raw, job_b.node_list_raw),
+        "Priority": (job_a.priority, job_b.priority),
+        "ReqTRES": (job_a.req_tres_raw, job_b.req_tres_raw),
+        "TimeLimit": (
+            job_a.request.time_limit_raw,
+            job_b.request.time_limit_raw,
+        ),
+    }
+    for field_name in SNAPSHOT_COMPARE_FIELDS:
+        val_a, val_b = mapping[field_name]
+        if val_a != val_b:
+            changed.append(field_name)
+    return changed
+
+
+def acquire_job_snapshot(
+    job_id: str,
+    runner: CommandRunner = execute_slurm_command,
+    commands_run: list[str] | None = None,
+) -> tuple[JobInfo | None, str | None]:
+    cmd = f"scontrol show job {shlex.quote(str(job_id))}"
+    if commands_run is not None:
+        commands_run.append(cmd)
+    res = runner(cmd)
+    if not res.ok or not res.stdout.strip():
+        return None, res.error or f"Could not retrieve job {job_id}"
+    job = parse_job_info(res.stdout)
+    if not job.job_id:
+        return None, f"Could not parse job information for {job_id}"
+    return job, None
+
+
+def acquire_partition(
+    partition_name: str,
+    runner: CommandRunner = execute_slurm_command,
+    commands_run: list[str] | None = None,
+) -> tuple[PartitionInfo | None, str | None]:
+    cmd = f"scontrol show partition {shlex.quote(partition_name)}"
+    if commands_run is not None:
+        commands_run.append(cmd)
+    res = runner(cmd)
+    if not res.ok or not res.stdout.strip():
+        return None, res.error or f"Could not retrieve partition '{partition_name}'"
+    part = parse_partition_info(res.stdout)
+    if not part.name:
+        return None, f"Partition '{partition_name}' not found."
+    return part, None
+
+
+def acquire_partition_nodes(
+    partition_name: str,
+    partition_info: PartitionInfo | None,
+    runner: CommandRunner = execute_slurm_command,
+    commands_run: list[str] | None = None,
+    warnings: list[str] | None = None,
+) -> list[str]:
+    cmd = f"sinfo -p {shlex.quote(partition_name)} -N"
+    if commands_run is not None:
+        commands_run.append(cmd)
+    res = runner(cmd)
+    nodes: list[str] = []
+    if res.ok and res.stdout.strip():
+        nodes = parse_sinfo_nodes(res.stdout)
+    elif warnings is not None and res.error:
+        warnings.append(f"sinfo node enumeration warning: {res.error}")
+
+    if partition_info and partition_info.nodes:
+        seen = set(nodes)
+        for n in partition_info.nodes:
+            if n not in seen:
+                seen.add(n)
+                nodes.append(n)
+    return nodes
+
+
+def acquire_nodes_details(
+    node_names: list[str],
+    runner: CommandRunner = execute_slurm_command,
+    commands_run: list[str] | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, NodeInfo]:
+    if not node_names:
+        return {}
+    nodelist_csv = ",".join(node_names)
+    cmd = f"scontrol show node {shlex.quote(nodelist_csv)}"
+    if commands_run is not None:
+        commands_run.append(cmd)
+    res = runner(cmd)
+    if not res.ok or not res.stdout.strip():
+        if warnings is not None and res.error:
+            warnings.append(f"Node detail query warning: {res.error}")
+        return {}
+    return parse_nodes_output(res.stdout)
+
+
+# ============================================================================
+# 9. candidate-node evaluation
+# ============================================================================
+
+
+def _partition_permits_timelimit(
+    part: PartitionInfo,
+    request: ResourceRequest,
+) -> TriState:
+    if part.max_time_unlimited:
+        return TriState.PASS
+    if part.max_time_seconds is not None:
+        if request.time_limit_unlimited:
+            return TriState.FAIL
+        if request.time_limit_seconds is not None:
+            return (
+                TriState.FAIL
+                if request.time_limit_seconds > part.max_time_seconds
+                else TriState.PASS
+            )
+    return TriState.UNKNOWN
+
+
+def assess_candidate_node(
+    request_or_job: ResourceRequest | JobInfo,
+    node: NodeInfo,
+    partition: PartitionInfo | list[PartitionInfo] | dict[str, PartitionInfo] | None = None,
+) -> CandidateNodeAssessment:
+    """
+    Evaluate a single node against a job resource request in the strict
+    11-step order defined by the diagnostic model:
+        1. partition membership
+        2. required/excluded node
+        3. constraints
+        4. GPU type
+        5. TOTAL GPU capacity
+        6. TOTAL CPU capacity
+        7. TOTAL memory capacity
+        8. node health/state
+        9. CURRENT GPU availability
+       10. CURRENT CPU availability
+       11. CURRENT memory availability
+    """
+    request = (
+        request_or_job.request
+        if isinstance(request_or_job, JobInfo)
+        else request_or_job
+    )
+
+    notes: list[str] = []
+    unschedulable_reasons: list[str] = []
+    shortage_resources: list[str] = []
+    matched_partitions: list[str] = []
+
+    if partition is None:
+        parts_list: list[PartitionInfo] = []
+    elif isinstance(partition, PartitionInfo):
+        parts_list = [partition]
+    elif isinstance(partition, dict):
+        parts_list = list(partition.values())
+    else:
+        parts_list = list(partition)
+
+    # 1. Partition membership (and multi-partition per-node TimeLimit policy compatibility)
+    partition_fit = TriState.PASS
+    if parts_list:
+        matching_parts: list[PartitionInfo] = []
+        unknown_parts: list[PartitionInfo] = []
+        for p in parts_list:
+            in_part_nodes = node.name in p.nodes if p.nodes else None
+            in_node_parts = p.name in node.partitions if node.partitions else None
+            if in_part_nodes is True or in_node_parts is True:
+                matching_parts.append(p)
+            elif in_part_nodes is None and in_node_parts is None:
+                unknown_parts.append(p)
+
+        matched_partitions = [p.name for p in matching_parts]
+        if not matching_parts:
+            if unknown_parts:
+                partition_fit = TriState.UNKNOWN
+            else:
+                partition_fit = TriState.FAIL
+                part_names_str = ", ".join(p.name for p in parts_list)
+                notes.append(
+                    f"Node {node.name} is not in partition {part_names_str}."
+                )
+        elif len(parts_list) > 1:
+            # In multi-partition mode, if at least one target partition permits TimeLimit
+            # but all partition(s) containing this node reject the job's TimeLimit,
+            # this node cannot run the job under its partition policy.
+            any_target_permits_tl = any(
+                _partition_permits_timelimit(p, request) == TriState.PASS
+                for p in parts_list
+            )
+            node_tl_states = [
+                _partition_permits_timelimit(p, request) for p in matching_parts
+            ]
+            if (
+                any_target_permits_tl
+                and node_tl_states
+                and all(s == TriState.FAIL for s in node_tl_states)
+            ):
+                partition_fit = TriState.FAIL
+                p_desc = ", ".join(
+                    f"{p.name} (MaxTime={format_duration_seconds(p.max_time_seconds, p.max_time_raw, p.max_time_unlimited)})"
+                    for p in matching_parts
+                )
+                notes.append(
+                    f"Node {node.name} only belongs to partition(s) {p_desc} whose MaxTime is shorter than requested TimeLimit."
+                )
+
+    # 2. Required / excluded node list
+    node_list_fit = TriState.PASS
+    if request.exc_nodes and node.name in request.exc_nodes:
+        node_list_fit = TriState.FAIL
+        notes.append(f"Node {node.name} is excluded by ExcNodeList.")
+    elif request.req_nodes and node.name not in request.req_nodes:
+        node_list_fit = TriState.FAIL
+        notes.append(f"Node {node.name} is not in ReqNodeList.")
+
+    # 3. Feature / constraint requirements
+    constraint_fit = TriState.PASS
+    if request.constraints:
+        if not node.features:
+            constraint_fit = TriState.UNKNOWN
+            notes.append(f"Node {node.name} features are unknown.")
+        else:
+            raw_c = (request.constraints_raw or "").strip()
+            if "|" in raw_c and "&" not in raw_c:
+                if not (request.constraints & node.features):
+                    constraint_fit = TriState.FAIL
+                    notes.append(
+                        f"Node {node.name} does not match any constraint in '{raw_c}'."
+                    )
+            else:
+                missing = request.constraints - node.features
+                if missing:
+                    constraint_fit = TriState.FAIL
+                    notes.append(
+                        f"Node {node.name} lacks required feature(s): {', '.join(sorted(missing))}."
+                    )
+
+    # 4. GPU type
+    gpu_type_fit = TriState.PASS
+    if request.gpu_count > 0 and request.gpu_type:
+        req_gtype = request.gpu_type.strip().lower()
+        node_gtype = (node.gpu_type or "").strip().lower()
+        if node.gpu_total == 0:
+            gpu_type_fit = TriState.FAIL
+            notes.append(f"Node {node.name} has no GPUs (requested {request.gpu_type}).")
+        elif not node_gtype and not node.features:
+            gpu_type_fit = TriState.UNKNOWN
+        else:
+            type_tokens = set(re.split(r"[-_:/\s]+", node_gtype)) if node_gtype else set()
+            if (
+                req_gtype == node_gtype
+                or req_gtype in type_tokens
+                or req_gtype in node.features
+            ):
+                gpu_type_fit = TriState.PASS
+            else:
+                gpu_type_fit = TriState.FAIL
+                notes.append(
+                    f"Node {node.name} GPU type '{node.gpu_type or 'none'}' does not match requested '{request.gpu_type}'."
+                )
+
+    # 5. TOTAL GPU capacity
+    total_gpu_fit = TriState.PASS
+    if request.gpu_count > 0:
+        if node.gpu_total is None:
+            total_gpu_fit = TriState.UNKNOWN
+        elif node.gpu_total < request.gpu_count:
+            total_gpu_fit = TriState.FAIL
+            notes.append(
+                f"Node {node.name} has {node.gpu_total} total GPU(s), fewer than requested {request.gpu_count}."
+            )
+
+    # 6. TOTAL CPU capacity
+    total_cpu_fit = TriState.PASS
+    if request.cpus is not None and request.cpus > 0:
+        if node.cpu_total is None:
+            total_cpu_fit = TriState.UNKNOWN
+        elif node.cpu_total < request.cpus:
+            total_cpu_fit = TriState.FAIL
+            notes.append(
+                f"Node {node.name} has {node.cpu_total} total CPUs, fewer than requested {request.cpus}."
+            )
+
+    # 7. TOTAL memory capacity
+    total_memory_fit = TriState.PASS
+    if request.memory_mb is not None and request.memory_mb > 0:
+        if node.memory_total_mb is None:
+            total_memory_fit = TriState.UNKNOWN
+        elif node.memory_total_mb < request.memory_mb:
+            total_memory_fit = TriState.FAIL
+            notes.append(
+                f"Node {node.name} has {format_memory_mb(node.memory_total_mb)} total memory, less than requested {format_memory_mb(request.memory_mb)}."
+            )
+
+    # Check static eligibility in strict evaluation order (steps 1-7)
+    static_checks: list[tuple[TriState, NodeClassification]] = [
+        (partition_fit, NodeClassification.INELIGIBLE_PARTITION),
+        (node_list_fit, NodeClassification.INELIGIBLE_NODE_LIST),
+        (constraint_fit, NodeClassification.INELIGIBLE_CONSTRAINT),
+        (gpu_type_fit, NodeClassification.INELIGIBLE_GPU_TYPE),
+        (total_gpu_fit, NodeClassification.INELIGIBLE_TOTAL_GPU_CAPACITY),
+        (total_cpu_fit, NodeClassification.INELIGIBLE_TOTAL_CPU_CAPACITY),
+        (total_memory_fit, NodeClassification.INELIGIBLE_TOTAL_MEMORY_CAPACITY),
+    ]
+
+    for check_state, fail_code in static_checks:
+        if check_state == TriState.FAIL:
+            return CandidateNodeAssessment(
+                node_name=node.name,
+                node=node,
+                statically_eligible=TriState.FAIL,
+                fits_now=TriState.FAIL,
+                classification=fail_code.value,
+                partition_fit=partition_fit,
+                node_list_fit=node_list_fit,
+                constraint_fit=constraint_fit,
+                gpu_type_fit=gpu_type_fit,
+                total_gpu_fit=total_gpu_fit,
+                total_cpu_fit=total_cpu_fit,
+                total_memory_fit=total_memory_fit,
+                node_schedulable=TriState.UNKNOWN,
+                current_gpu_fit=TriState.UNKNOWN,
+                current_cpu_fit=TriState.UNKNOWN,
+                current_memory_fit=TriState.UNKNOWN,
+                is_planned=("PLANNED" in node.state_flags),
+                matched_partitions=matched_partitions,
+                unschedulable_reasons=unschedulable_reasons,
+                shortage_resources=shortage_resources,
+                notes=notes,
+            )
+
+    statically_eligible = (
+        TriState.UNKNOWN
+        if any(s == TriState.UNKNOWN for s, _ in static_checks)
+        else TriState.PASS
+    )
+
+    # 8. Node health / state
+    node_schedulable = TriState.PASS
+    is_planned = "PLANNED" in node.state_flags
+    hard_flags = sorted(node.state_flags & HARD_UNSCHEDULABLE_STATES)
+    if hard_flags:
+        node_schedulable = TriState.FAIL
+        unschedulable_reasons.extend(hard_flags)
+        reason_suffix = f" ({node.reason})" if node.reason else ""
+        notes.append(
+            f"Node {node.name} is in unschedulable state {node.state_raw}{reason_suffix}."
+        )
+    elif not node.state_flags or "UNKNOWN" in node.state_flags:
+        node_schedulable = TriState.UNKNOWN
+
+    # 9. CURRENT GPU availability
+    current_gpu_fit = TriState.PASS
+    if request.gpu_count > 0:
+        if node.gpu_free is None:
+            current_gpu_fit = TriState.UNKNOWN
+        elif node.gpu_free < request.gpu_count:
+            current_gpu_fit = TriState.FAIL
+            shortage_resources.append("GPU")
+            notes.append(
+                f"Node {node.name} has {node.gpu_free}/{node.gpu_total} free GPU(s); job needs {request.gpu_count}."
+            )
+
+    # 10. CURRENT CPU availability
+    current_cpu_fit = TriState.PASS
+    if request.cpus is not None and request.cpus > 0:
+        if node.cpu_free is None:
+            current_cpu_fit = TriState.UNKNOWN
+        elif node.cpu_free < request.cpus:
+            current_cpu_fit = TriState.FAIL
+            shortage_resources.append("CPU")
+            notes.append(
+                f"Node {node.name} has {node.cpu_free}/{node.cpu_total} free CPUs; job needs {request.cpus}."
+            )
+
+    # 11. CURRENT memory availability
+    current_memory_fit = TriState.PASS
+    if request.memory_mb is not None and request.memory_mb > 0:
+        if node.memory_free_mb is None:
+            current_memory_fit = TriState.UNKNOWN
+        elif node.memory_free_mb < request.memory_mb:
+            current_memory_fit = TriState.FAIL
+            shortage_resources.append("MEMORY")
+            notes.append(
+                f"Node {node.name} has {format_memory_mb(node.memory_free_mb)} free memory; job needs {format_memory_mb(request.memory_mb)}."
+            )
+
+    # Determine Layer 2 classification
+    if node_schedulable == TriState.FAIL:
+        classification = NodeClassification.ELIGIBLE_NODE_UNSCHEDULABLE.value
+        fits_now = TriState.FAIL
+    elif len(shortage_resources) > 1:
+        classification = NodeClassification.ELIGIBLE_MULTIPLE_SHORTAGES.value
+        fits_now = TriState.FAIL
+    elif shortage_resources == ["GPU"]:
+        classification = NodeClassification.ELIGIBLE_GPU_SHORTAGE.value
+        fits_now = TriState.FAIL
+    elif shortage_resources == ["CPU"]:
+        classification = NodeClassification.ELIGIBLE_CPU_SHORTAGE.value
+        fits_now = TriState.FAIL
+    elif shortage_resources == ["MEMORY"]:
+        classification = NodeClassification.ELIGIBLE_MEMORY_SHORTAGE.value
+        fits_now = TriState.FAIL
+    elif any(
+        c == TriState.UNKNOWN
+        for c in (current_gpu_fit, current_cpu_fit, current_memory_fit)
+    ):
+        fits_now = TriState.UNKNOWN
+        classification = (
+            NodeClassification.ELIGIBLE_PLANNED_REVIEW_REQUIRED.value
+            if is_planned
+            else NodeClassification.ELIGIBLE_FITS_NOW.value
+        )
+    elif is_planned:
+        fits_now = TriState.PASS
+        classification = (
+            NodeClassification.ELIGIBLE_PLANNED_REVIEW_REQUIRED.value
+        )
+    else:
+        fits_now = TriState.PASS
+        classification = NodeClassification.ELIGIBLE_FITS_NOW.value
+
+    return CandidateNodeAssessment(
+        node_name=node.name,
+        node=node,
+        statically_eligible=statically_eligible,
+        fits_now=fits_now,
+        classification=classification,
+        partition_fit=partition_fit,
+        node_list_fit=node_list_fit,
+        constraint_fit=constraint_fit,
+        gpu_type_fit=gpu_type_fit,
+        total_gpu_fit=total_gpu_fit,
+        total_cpu_fit=total_cpu_fit,
+        total_memory_fit=total_memory_fit,
+        node_schedulable=node_schedulable,
+        current_gpu_fit=current_gpu_fit,
+        current_cpu_fit=current_cpu_fit,
+        current_memory_fit=current_memory_fit,
+        is_planned=is_planned,
+        matched_partitions=matched_partitions,
+        unschedulable_reasons=unschedulable_reasons,
+        shortage_resources=shortage_resources,
+        notes=notes,
+    )
+
+
+# ============================================================================
+# 10. diagnosis rules
+# ============================================================================
+
+
+def _diagnose_node_states_and_resources(
+    job: JobInfo,
+    assessments: list[CandidateNodeAssessment],
+) -> list[DiagnosisFinding]:
+    """
+    Evaluate Layer 1 (static eligibility) and Layer 2 (node health and current
+    per-node resource fit) across candidate node assessments.
+    """
+    findings: list[DiagnosisFinding] = []
+    req = job.request
+
+    eligible = [
+        a for a in assessments if a.statically_eligible != TriState.FAIL
+    ]
+
+    if not assessments or not eligible:
+        reasons = [n for a in assessments for n in a.notes]
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.NO_STATICALLY_ELIGIBLE_NODE.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary="No candidate node is statically eligible to run this job.",
+                details=(
+                    " ".join(reasons)
+                    if reasons
+                    else "No candidate nodes matched the partition and static resource requirements."
+                ),
+                evidence=reasons,
+            )
+        )
+        return findings
+
+    # Node state findings on statically eligible nodes
+    drained_nodes = [
+        a
+        for a in eligible
+        if a.node.state_flags & {"DRAIN", "DRAINED", "DRAINING"}
+    ]
+    down_nodes = [a for a in eligible if "DOWN" in a.node.state_flags]
+    not_resp_nodes = [
+        a for a in eligible if "NOT_RESPONDING" in a.node.state_flags
+    ]
+    maint_nodes = [a for a in eligible if "MAINT" in a.node.state_flags]
+
+    if down_nodes:
+        ev = [
+            f"{a.node_name}: State={a.node.state_raw}"
+            + (f" (Reason={a.node.reason})" if a.node.reason else "")
+            for a in down_nodes
+        ]
+        names = ", ".join(a.node_name for a in down_nodes)
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.NODE_DOWN.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=f"Candidate node(s) down: {names}.",
+                details="; ".join(ev),
+                evidence=ev,
+            )
+        )
+
+    if drained_nodes:
+        ev = [
+            f"{a.node_name}: State={a.node.state_raw}"
+            + (f" (Reason={a.node.reason})" if a.node.reason else "")
+            for a in drained_nodes
+        ]
+        names = ", ".join(a.node_name for a in drained_nodes)
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.NODE_DRAINED.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=f"Candidate node(s) drained and unavailable for new jobs: {names}.",
+                details="; ".join(ev),
+                evidence=ev,
+            )
+        )
+
+    if not_resp_nodes:
+        ev = [
+            f"{a.node_name}: State={a.node.state_raw}"
+            + (f" (Reason={a.node.reason})" if a.node.reason else "")
+            for a in not_resp_nodes
+        ]
+        names = ", ".join(a.node_name for a in not_resp_nodes)
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.NODE_NOT_RESPONDING.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=f"Candidate node(s) not responding: {names}.",
+                details="; ".join(ev),
+                evidence=ev,
+            )
+        )
+
+    if maint_nodes:
+        ev = [
+            f"{a.node_name}: State={a.node.state_raw}"
+            + (f" (Reason={a.node.reason})" if a.node.reason else "")
+            for a in maint_nodes
+        ]
+        names = ", ".join(a.node_name for a in maint_nodes)
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.NODE_MAINTENANCE.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=f"Candidate node(s) in maintenance state: {names}.",
+                details="; ".join(ev),
+                evidence=ev,
+            )
+        )
+
+    # Evaluate current resource fit across schedulable eligible nodes
+    schedulable = [
+        a for a in eligible if a.node_schedulable == TriState.PASS
+    ]
+    fitting_now = [a for a in schedulable if a.fits_now == TriState.PASS]
+
+    if schedulable and not fitting_now:
+        classifications = {a.classification for a in schedulable}
+        if classifications == {
+            NodeClassification.ELIGIBLE_GPU_SHORTAGE.value
+        }:
+            ev = [
+                f"{a.node_name}: {a.node.gpu_free}/{a.node.gpu_total} free GPU(s) (job requires {req.gpu_count} on a single node)"
+                for a in schedulable
+            ]
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.CURRENT_GPU_SHORTAGE.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary=(
+                        f"Insufficient free GPUs per node across all {len(schedulable)} schedulable candidate node(s) "
+                        f"(job requires {req.gpu_count} GPU(s) on a single node)."
+                    ),
+                    details="; ".join(ev),
+                    evidence=ev,
+                )
+            )
+        elif classifications == {
+            NodeClassification.ELIGIBLE_CPU_SHORTAGE.value
+        }:
+            ev = [
+                f"{a.node_name}: {a.node.cpu_free}/{a.node.cpu_total} free CPUs (job requires {req.cpus})"
+                for a in schedulable
+            ]
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.CURRENT_CPU_SHORTAGE.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary=(
+                        f"Insufficient free CPUs across all {len(schedulable)} schedulable candidate node(s) "
+                        f"(job requires {req.cpus} CPUs)."
+                    ),
+                    details="; ".join(ev),
+                    evidence=ev,
+                )
+            )
+        elif classifications == {
+            NodeClassification.ELIGIBLE_MEMORY_SHORTAGE.value
+        }:
+            ev = [
+                f"{a.node_name}: {format_memory_mb(a.node.memory_free_mb)} free memory (job requires {format_memory_mb(req.memory_mb)})"
+                for a in schedulable
+            ]
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.CURRENT_MEMORY_SHORTAGE.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary=(
+                        f"Insufficient free memory across all {len(schedulable)} schedulable candidate node(s) "
+                        f"(job requires {format_memory_mb(req.memory_mb)})."
+                    ),
+                    details="; ".join(ev),
+                    evidence=ev,
+                )
+            )
+        elif any(a.shortage_resources for a in schedulable):
+            ev = [
+                f"{a.node_name}: shortage in {', '.join(a.shortage_resources)} ({'; '.join(a.notes)})"
+                for a in schedulable
+            ]
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.CURRENT_MULTIPLE_RESOURCE_SHORTAGES.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary="No schedulable candidate node currently has enough free resources (multiple resource shortages).",
+                    details="; ".join(ev),
+                    evidence=ev,
+                )
+            )
+
+    return findings
+
+
+def _infer_reference_time(
+    snapshot: AcquisitionSnapshot,
+    job: JobInfo,
+) -> datetime:
+    if snapshot.reference_time is not None:
+        return snapshot.reference_time
+    last_eval_raw = job.raw_fields.get("LastSchedEval")
+    last_eval = parse_slurm_datetime(last_eval_raw)
+    if last_eval is not None:
+        return last_eval
+    if job.submit_time is not None:
+        return job.submit_time
+    return datetime.now()
+
+
+def _evaluate_reservations(
+    job: JobInfo,
+    eligible: list[CandidateNodeAssessment],
+    reservations: list[ReservationInfo],
+    ref_time: datetime,
+) -> tuple[TriState, list[DiagnosisFinding]]:
+    """
+    Evaluate whether any reservation overlaps candidate nodes AND the job's
+    requested walltime window [ref_time, ref_time + time_limit].
+    """
+    if not reservations:
+        return TriState.UNKNOWN, []
+
+    eligible_names = {a.node_name for a in eligible}
+    if not eligible_names:
+        return TriState.UNKNOWN, []
+
+    job_tl_sec = job.request.time_limit_seconds
+    job_window_end = (
+        ref_time + timedelta(seconds=job_tl_sec)
+        if job_tl_sec is not None
+        else None
+    )
+
+    overlapping_findings: list[DiagnosisFinding] = []
+    any_unknown_time = False
+
+    user_low = job.user.lower() if job.user else ""
+    acct_low = job.account.lower() if job.account else ""
+    acct_base = acct_low.split(".prj", 1)[0] if ".prj" in acct_low else acct_low
+
+    for resv in reservations:
+        node_overlap = sorted(resv.nodes & eligible_names)
+        if not node_overlap:
+            continue
+
+        # Check time overlap
+        if resv.end_time is not None and resv.end_time <= ref_time:
+            continue
+
+        if resv.start_time is None:
+            any_unknown_time = True
+            continue
+
+        if job_window_end is not None and resv.start_time > job_window_end:
+            # Reservation starts after current_time + job_time_limit -> not a current walltime blocker!
+            continue
+
+        # Check if reservation is usable by this job (non-MAINT and user/account allowed)
+        is_maint = bool(resv.flags & {"MAINT", "IGNORE_JOBS"})
+        user_allowed = bool(user_low and user_low in resv.users)
+        acct_allowed = bool(
+            (acct_low and acct_low in resv.accounts)
+            or (acct_base and acct_base in resv.accounts)
+        )
+        job_resv_req = job.raw_fields.get("Reservation", "").strip()
+        if (
+            not is_maint
+            and (user_allowed or acct_allowed)
+            and job_resv_req
+            and job_resv_req == resv.name
+        ):
+            continue
+
+        conf = (
+            Confidence.CONFIRMED.value
+            if job.reason in {"ReqNodeNotAvail", "Reservation"}
+            or set(node_overlap) == eligible_names
+            else Confidence.SUPPORTED.value
+        )
+        ev = (
+            f"Reservation '{resv.name}' on {', '.join(node_overlap)} "
+            f"from {format_datetime(resv.start_time, resv.start_time_raw)} "
+            f"to {format_datetime(resv.end_time, resv.end_time_raw)} "
+            f"overlaps job walltime window ({format_duration_seconds(job_tl_sec, job.request.time_limit_raw)})."
+        )
+        overlapping_findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.RESERVATION_OVERLAP.value,
+                confidence=conf,
+                summary=(
+                    f"Reservation '{resv.name}' overlaps candidate node(s) {', '.join(node_overlap)} "
+                    f"within the requested walltime window."
+                ),
+                details=ev,
+                evidence=[ev],
+            )
+        )
+
+    if overlapping_findings:
+        return TriState.FAIL, overlapping_findings
+    if any_unknown_time:
+        return TriState.UNKNOWN, []
+    return TriState.PASS, []
+
+
+def _evaluate_planned_and_competitors(
+    job: JobInfo,
+    eligible: list[CandidateNodeAssessment],
+    competitors: list[JobInfo],
+    ref_time: datetime,
+    effective_sched_nodes: list[str],
+) -> list[DiagnosisFinding]:
+    """
+    Evaluate PLANNED node states and concrete higher-priority future scheduled
+    jobs on candidate nodes.
+
+    Future scheduled-job conflicts are associated strictly with the candidate
+    node(s) in each competitor's `SchedNodeList`. Global
+    `FUTURE_SCHEDULED_JOB_CONFLICT` is emitted only when the conflict constrains
+    the target job's relevant scheduling path (its `effective_sched_nodes` if
+    assigned, or the viable candidate nodes otherwise).
+    """
+    findings: list[DiagnosisFinding] = []
+    planned_assessments = [a for a in eligible if a.is_planned]
+    eligible_by_name = {a.node_name: a for a in eligible}
+
+    job_tl_sec = job.request.time_limit_seconds
+    job_window_end = (
+        ref_time + timedelta(seconds=job_tl_sec)
+        if job_tl_sec is not None
+        else None
+    )
+
+    conflicts_by_node: dict[str, list[str]] = {}
+
+    for comp in competitors:
+        if comp.job_id == job.job_id:
+            continue
+        # Only consider higher-priority competitors when both priorities are known
+        if (
+            job.priority is not None
+            and comp.priority is not None
+            and comp.priority <= job.priority
+        ):
+            continue
+
+        comp_nodes = [
+            n for n in comp.sched_node_list if n in eligible_by_name
+        ]
+        if not comp_nodes:
+            continue
+
+        # Check timing conflict against [ref_time, ref_time + job.time_limit]
+        timing_conflicts = False
+        if comp.start_time is not None:
+            if job_window_end is not None:
+                if job_window_end > comp.start_time:
+                    timing_conflicts = True
+            else:
+                timing_conflicts = True
+        else:
+            timing_conflicts = True
+
+        if not timing_conflicts:
+            continue
+
+        for cnode_name in comp_nodes:
+            cand = eligible_by_name[cnode_name]
+            n_info = cand.node
+            # Check whether running both jobs would conflict on resources on this node
+            gpu_conflict = (
+                job.request.gpu_count > 0
+                and comp.request.gpu_count > 0
+                and (
+                    (
+                        n_info.gpu_free is not None
+                        and n_info.gpu_free
+                        < job.request.gpu_count + comp.request.gpu_count
+                    )
+                    or (
+                        n_info.gpu_total is not None
+                        and n_info.gpu_total
+                        < job.request.gpu_count + comp.request.gpu_count
+                    )
+                )
+            )
+            cpu_conflict = (
+                job.request.cpus is not None
+                and comp.request.cpus is not None
+                and n_info.cpu_free is not None
+                and n_info.cpu_free < job.request.cpus + comp.request.cpus
+            )
+            mem_conflict = (
+                job.request.memory_mb is not None
+                and comp.request.memory_mb is not None
+                and n_info.memory_free_mb is not None
+                and n_info.memory_free_mb
+                < job.request.memory_mb + comp.request.memory_mb
+            )
+            if gpu_conflict or cpu_conflict or mem_conflict or comp.request.gpu_count > 0:
+                prio_note = (
+                    f" (priority {comp.priority:,})"
+                    if comp.priority is not None
+                    else ""
+                )
+                start_note = format_datetime(comp.start_time, comp.start_time_raw)
+                ev_str = (
+                    f"Higher-priority job {comp.job_id}{prio_note} requesting "
+                    f"{comp.request.gpu_count} GPU(s) is scheduled on {cnode_name} "
+                    f"at {start_note}, before target job's "
+                    f"{format_duration_seconds(job_tl_sec, job.request.time_limit_raw)} TimeLimit could finish."
+                )
+                conflicts_by_node.setdefault(cnode_name, []).append(ev_str)
+                cand_note = (
+                    f"Future scheduled job {comp.job_id}{prio_note} on {cnode_name} at {start_note}."
+                )
+                if cand_note not in cand.notes:
+                    cand.notes.append(cand_note)
+
+    all_conflict_nodes = set(conflicts_by_node.keys())
+    all_conflict_evidences = [
+        ev
+        for n in sorted(conflicts_by_node.keys())
+        for ev in conflicts_by_node[n]
+    ]
+
+    # Determine whether conflicts actually constrain the target job's scheduling path
+    target_sched_set = set(effective_sched_nodes)
+    blocking_conflict_nodes: list[str] = []
+    blocking_conflict_evidences: list[str] = []
+
+    if target_sched_set:
+        # Target job already has a scheduled node(s): only conflicts on those
+        # scheduled node(s) constrain its assigned scheduling path.
+        for n in sorted(target_sched_set):
+            if n in conflicts_by_node:
+                blocking_conflict_nodes.append(n)
+                blocking_conflict_evidences.extend(conflicts_by_node[n])
+    elif conflicts_by_node:
+        # Target job has no scheduled node yet: check if conflicts block the
+        # candidate node(s) that could otherwise take the job now/planned, or all eligible nodes.
+        viable_now_nodes = {
+            a.node_name
+            for a in eligible
+            if a.node_schedulable == TriState.PASS
+            and (a.fits_now == TriState.PASS or a.is_planned)
+        }
+        eligible_names = set(eligible_by_name.keys())
+        if (
+            (viable_now_nodes and viable_now_nodes <= all_conflict_nodes)
+            or (eligible_names and eligible_names <= all_conflict_nodes)
+        ):
+            blocking_conflict_nodes = sorted(all_conflict_nodes)
+            blocking_conflict_evidences = list(all_conflict_evidences)
+
+    if planned_assessments:
+        planned_names = [a.node_name for a in planned_assessments]
+        target_on_planned = [
+            n for n in planned_names if n in effective_sched_nodes
+        ]
+        if target_on_planned and not blocking_conflict_nodes:
+            ev = [
+                f"{a.node_name}: State={a.node.state_raw}"
+                + (
+                    f" (scheduled for target job {job.job_id})"
+                    if a.node_name in target_sched_set
+                    else ""
+                )
+                for a in planned_assessments
+            ] + all_conflict_evidences
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.NODE_PLANNED.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary=(
+                        f"Candidate node(s) {', '.join(planned_names)} have PLANNED state "
+                        f"(SLURM has reserved resources on {', '.join(target_on_planned)} for this job)."
+                    ),
+                    details="; ".join(ev),
+                    evidence=ev,
+                )
+            )
+        elif all_conflict_nodes:
+            ev = [
+                f"{a.node_name}: State={a.node.state_raw}"
+                for a in planned_assessments
+            ] + all_conflict_evidences
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.NODE_PLANNED.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary=(
+                        f"Candidate node(s) {', '.join(planned_names)} are in PLANNED state "
+                        f"for future scheduled allocations."
+                    ),
+                    details="; ".join(ev),
+                    evidence=ev,
+                )
+            )
+        else:
+            ev = [
+                f"{a.node_name}: State={a.node.state_raw}; exact future scheduled job could not be confirmed from user-visible queue data."
+                for a in planned_assessments
+            ]
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.NODE_PLANNED.value,
+                    confidence=Confidence.SUPPORTED.value,
+                    summary=(
+                        f"Candidate node(s) {', '.join(planned_names)} are in PLANNED state, "
+                        f"indicating SLURM is holding resources for a future scheduled job, "
+                        f"though the exact future allocation could not be confirmed."
+                    ),
+                    details="; ".join(ev),
+                    evidence=ev,
+                )
+            )
+
+    if blocking_conflict_evidences:
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.FUTURE_SCHEDULED_JOB_CONFLICT.value,
+                confidence=Confidence.SUPPORTED.value,
+                summary=(
+                    f"A higher-priority future scheduled job on {', '.join(blocking_conflict_nodes)} "
+                    f"conflicts with this job's requested walltime window."
+                ),
+                details="; ".join(blocking_conflict_evidences),
+                evidence=blocking_conflict_evidences,
+            )
+        )
+
+    return findings
+
+
+def _evaluate_partition_policies(
+    job: JobInfo,
+    partition: PartitionInfo | list[PartitionInfo] | dict[str, PartitionInfo] | None,
+    account_ancestors: set[str],
+    is_alternative_partition: bool,
+    account_hierarchy_complete: bool = False,
+) -> tuple[TriState, TriState, TriState, list[DiagnosisFinding]]:
+    """
+    Evaluate partition policy compatibility across one or more target partitions:
+    TimeLimit, Account, and QoS.
+    Returns (time_limit_fit, account_fit, qos_fit, policy_findings).
+    """
+    findings: list[DiagnosisFinding] = []
+    reason_low = (job.reason or "").strip().lower()
+
+    if partition is None:
+        parts_list: list[PartitionInfo] = []
+    elif isinstance(partition, PartitionInfo):
+        parts_list = [partition]
+    elif isinstance(partition, dict):
+        parts_list = list(partition.values())
+    else:
+        parts_list = list(partition)
+
+    # 1. TimeLimit fit (PASS if at least one target partition permits TimeLimit)
+    tl_states: list[tuple[PartitionInfo, TriState]] = [
+        (p, _partition_permits_timelimit(p, job.request)) for p in parts_list
+    ]
+    if any(s == TriState.PASS for _, s in tl_states):
+        time_limit_fit = TriState.PASS
+    elif tl_states and all(s == TriState.FAIL for _, s in tl_states):
+        time_limit_fit = TriState.FAIL
+    else:
+        time_limit_fit = TriState.UNKNOWN
+
+    if (
+        time_limit_fit == TriState.FAIL
+        or (
+            not is_alternative_partition
+            and reason_low == "partitiontimelimit"
+            and time_limit_fit != TriState.PASS
+        )
+    ):
+        time_limit_fit = TriState.FAIL
+        req_t_str = format_duration_seconds(
+            job.request.time_limit_seconds,
+            job.request.time_limit_raw,
+            job.request.time_limit_unlimited,
+        )
+        if len(parts_list) == 1:
+            p0 = parts_list[0]
+            max_t_str = format_duration_seconds(
+                p0.max_time_seconds,
+                p0.max_time_raw,
+                p0.max_time_unlimited,
+            )
+            ev = f"Job TimeLimit ({req_t_str}) exceeds partition '{p0.name}' MaxTime ({max_t_str})."
+        elif len(parts_list) > 1:
+            p_descs = ", ".join(
+                f"'{p.name}' ({format_duration_seconds(p.max_time_seconds, p.max_time_raw, p.max_time_unlimited)})"
+                for p in parts_list
+            )
+            ev = f"Job TimeLimit ({req_t_str}) exceeds MaxTime across all target partitions: {p_descs}."
+        else:
+            ev = f"Job TimeLimit ({req_t_str}) exceeds partition '{job.partition}' MaxTime (partition limit)."
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.PARTITION_TIME_LIMIT_EXCEEDED.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=ev,
+                details=ev,
+                evidence=[ev],
+            )
+        )
+
+    # 2. Account fit (conservative tri-state evaluation):
+    # - PASS if job_account or a proven ancestor in account_ancestors is an exact
+    #   member of AllowAccounts (or AllowAccounts contains ALL).
+    # - FAIL only if explicitly in DenyAccounts, SLURM explicitly reports
+    #   InvalidAccount/AccountNotAllowed, or the account ancestry chain is
+    #   demonstrably complete (reaches 'root' / account_hierarchy_complete=True)
+    #   and no ancestor matches AllowAccounts.
+    # - UNKNOWN when literal non-membership occurs without a complete ancestry chain.
+    acct_candidates = {a.strip().lower() for a in account_ancestors if a and a.strip()}
+    if job.account and not is_null_value(job.account):
+        acct_candidates.add(job.account.strip().lower())
+
+    hierarchy_complete = bool(
+        account_hierarchy_complete or ("root" in acct_candidates)
+    )
+
+    acct_states: list[tuple[PartitionInfo, TriState]] = []
+    if acct_candidates:
+        for p in parts_list:
+            if acct_candidates & p.deny_accounts:
+                acct_states.append((p, TriState.FAIL))
+            elif p.allow_accounts is not None:
+                if "ALL" in p.allow_accounts or (
+                    acct_candidates & p.allow_accounts
+                ):
+                    acct_states.append((p, TriState.PASS))
+                elif hierarchy_complete:
+                    acct_states.append((p, TriState.FAIL))
+                else:
+                    acct_states.append((p, TriState.UNKNOWN))
+            else:
+                acct_states.append((p, TriState.UNKNOWN))
+
+    if not is_alternative_partition and reason_low in {
+        "invalidaccount",
+        "accountnotallowed",
+    }:
+        account_fit = TriState.FAIL
+    elif any(s == TriState.PASS for _, s in acct_states):
+        account_fit = TriState.PASS
+    elif acct_states and all(s == TriState.FAIL for _, s in acct_states):
+        account_fit = TriState.FAIL
+    else:
+        account_fit = TriState.UNKNOWN
+
+    if account_fit == TriState.FAIL:
+        if len(parts_list) == 1:
+            p0 = parts_list[0]
+            allowed_str = (
+                ", ".join(sorted(p0.allow_accounts))
+                if p0.allow_accounts
+                else "none"
+            )
+            ev = f"Job account '{job.account}' is not in partition '{p0.name}' AllowAccounts ({allowed_str})."
+        elif len(parts_list) > 1:
+            p_names = ", ".join(f"'{p.name}'" for p in parts_list)
+            ev = f"Job account '{job.account}' is not allowed in any target partition ({p_names})."
+        else:
+            ev = f"Job account '{job.account}' is not in partition '{job.partition}' AllowAccounts (none)."
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.ACCOUNT_NOT_ALLOWED.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=ev,
+                details=ev,
+                evidence=[ev],
+            )
+        )
+
+    # 3. QoS fit (PASS if at least one target partition allows the QoS)
+    qos_low = job.qos.strip().lower() if job.qos else ""
+    qos_states: list[tuple[PartitionInfo, TriState]] = []
+    if qos_low:
+        for p in parts_list:
+            if qos_low in p.deny_qos:
+                qos_states.append((p, TriState.FAIL))
+            elif p.allow_qos is not None:
+                if "ALL" in p.allow_qos or qos_low in p.allow_qos:
+                    qos_states.append((p, TriState.PASS))
+                else:
+                    qos_states.append((p, TriState.FAIL))
+            else:
+                qos_states.append((p, TriState.UNKNOWN))
+
+    if not is_alternative_partition and reason_low in {
+        "invalidqos",
+        "qosnotallowed",
+    }:
+        qos_fit = TriState.FAIL
+    elif any(s == TriState.PASS for _, s in qos_states):
+        qos_fit = TriState.PASS
+    elif qos_states and all(s == TriState.FAIL for _, s in qos_states):
+        qos_fit = TriState.FAIL
+    else:
+        qos_fit = TriState.UNKNOWN
+
+    if qos_fit == TriState.FAIL:
+        if len(parts_list) == 1:
+            p0 = parts_list[0]
+            allowed_q_str = (
+                ", ".join(sorted(p0.allow_qos))
+                if p0.allow_qos
+                else "none"
+            )
+            ev = f"Job QoS '{job.qos}' is not allowed in partition '{p0.name}' AllowQos ({allowed_q_str})."
+        elif len(parts_list) > 1:
+            p_names = ", ".join(f"'{p.name}'" for p in parts_list)
+            ev = f"Job QoS '{job.qos}' is not allowed in any target partition ({p_names})."
+        else:
+            ev = f"Job QoS '{job.qos}' is not allowed in partition '{job.partition}' AllowQos (none)."
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.QOS_NOT_ALLOWED.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=ev,
+                details=ev,
+                evidence=[ev],
+            )
+        )
+
+    return time_limit_fit, account_fit, qos_fit, findings
+
+
+def run_diagnosis_rules(
+    snapshot: AcquisitionSnapshot,
+    assessments: list[CandidateNodeAssessment],
+    is_alternative_partition: bool = False,
+) -> tuple[
+    list[DiagnosisFinding],
+    TriState,
+    TriState,
+    TriState,
+    TriState,
+]:
+    job = snapshot.job_snapshot_b or snapshot.job_snapshot_a
+    active_partitions = (
+        snapshot.evaluation_partitions
+        if snapshot.evaluation_partitions
+        else snapshot.submitted_partitions
+    )
+    partition = snapshot.evaluation_partition or snapshot.submitted_partition
+    findings: list[DiagnosisFinding] = []
+
+    # Snapshot consistency check (Section 12)
+    if snapshot.snapshot_changed:
+        changed_str = ", ".join(snapshot.changed_fields)
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.SCHEDULER_STATE_CHANGED.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=(
+                    "Job scheduling state changed during diagnosis. "
+                    "The report reflects the latest observed state."
+                ),
+                details=f"Changed fields between snapshots: {changed_str}.",
+                evidence=[f"Updated fields: {changed_str}"],
+            )
+        )
+
+    # RUNNING job branch (Section 24 AT12)
+    if job.state.upper() == "RUNNING" and not is_alternative_partition:
+        nodes_str = ", ".join(job.node_list) if job.node_list else (job.node_list_raw or "assigned node")
+        ev = f"Job {job.job_id} is currently RUNNING on {nodes_str}."
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.JOB_ALREADY_RUNNING.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=ev,
+                details=ev,
+                evidence=[ev],
+            )
+        )
+        return (
+            findings,
+            TriState.PASS,
+            TriState.PASS,
+            TriState.PASS,
+            TriState.PASS,
+        )
+
+    # Layer 1: Partition policy compatibility
+    time_limit_fit, account_fit, qos_fit, policy_findings = (
+        _evaluate_partition_policies(
+            job,
+            active_partitions if active_partitions else partition,
+            snapshot.account_ancestors,
+            is_alternative_partition=is_alternative_partition,
+            account_hierarchy_complete=snapshot.account_hierarchy_complete,
+        )
+    )
+
+    # Layer 1 & 2: Candidate node states and current resource fit
+    node_and_res_findings = _diagnose_node_states_and_resources(
+        job, assessments
+    )
+
+    eligible = [
+        a for a in assessments if a.statically_eligible != TriState.FAIL
+    ]
+    schedulable = [
+        a for a in eligible if a.node_schedulable == TriState.PASS
+    ]
+    fitting_now = [a for a in schedulable if a.fits_now == TriState.PASS]
+
+    reason_clean = (job.reason or "").strip()
+    reason_low = reason_clean.lower()
+    explicit_primary_reasons = {
+        "jobheldadmin",
+        "jobhelduser",
+        "dependency",
+        "jobarraytasklimit",
+        "partitionconfig",
+    }
+
+    failed_deps: list[str] = []
+    failed_dep_finding: DiagnosisFinding | None = None
+    if not is_alternative_partition and job.state.upper() == "PENDING":
+        failed_deps = find_failed_dependencies(job.dependency_raw)
+        if failed_deps:
+            dep_joined = ", ".join(failed_deps)
+            failed_dep_finding = DiagnosisFinding(
+                code=DiagnosisCode.DEPENDENCY_FAILED.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=(
+                    f"Additional blocker: dependency {dep_joined} has failed and cannot be satisfied."
+                ),
+                details=(
+                    f"SLURM job metadata reports Dependency={job.dependency_raw}, which contains failed dependency state ({dep_joined})."
+                ),
+                evidence=list(failed_deps),
+            )
+
+    # Explicit SLURM Pending Reason precedence (when evaluating submitted partition)
+    if (
+        not is_alternative_partition
+        and job.state.upper() == "PENDING"
+        and reason_low in explicit_primary_reasons
+    ):
+        shortage_codes = {
+            DiagnosisCode.CURRENT_GPU_SHORTAGE.value,
+            DiagnosisCode.CURRENT_CPU_SHORTAGE.value,
+            DiagnosisCode.CURRENT_MEMORY_SHORTAGE.value,
+            DiagnosisCode.CURRENT_MULTIPLE_RESOURCE_SHORTAGES.value,
+        }
+        non_shortage_node_findings = [
+            f for f in node_and_res_findings if f.code not in shortage_codes
+        ]
+
+        if reason_low == "jobheldadmin":
+            fit_note = (
+                f" Candidate node(s) ({', '.join(a.node_name for a in fitting_now)}) currently have sufficient free resources, "
+                f"but the job cannot be scheduled until the administrative hold is released."
+                if fitting_now
+                else ""
+            )
+            ev = (
+                f"Job is administratively held (Reason=JobHeldAdmin) and is not currently eligible to start.{fit_note}"
+            )
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.JOB_HELD_ADMIN.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary=ev,
+                    details=ev,
+                    evidence=[ev],
+                )
+            )
+        elif reason_low == "jobhelduser":
+            fit_note = (
+                f" Candidate node(s) ({', '.join(a.node_name for a in fitting_now)}) currently have sufficient free resources, "
+                f"but the job will not start until the hold is released."
+                if fitting_now
+                else ""
+            )
+            ev = (
+                f"Job is user-held (Reason=JobHeldUser) and will not start until that hold is released.{fit_note}"
+            )
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.JOB_HELD_USER.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary=ev,
+                    details=ev,
+                    evidence=[ev],
+                )
+            )
+        elif reason_low == "dependency":
+            dep_desc = f" ({job.dependency_raw})" if job.dependency_raw else ""
+            ev = (
+                f"Job is waiting for its dependency condition{dep_desc} to be satisfied (Reason=Dependency)."
+            )
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.DEPENDENCY_WAIT.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary=ev,
+                    details=ev,
+                    evidence=[ev],
+                )
+            )
+        elif reason_low == "jobarraytasklimit":
+            ev = (
+                "Job-array concurrency/task limit is currently preventing this task from becoming eligible to run "
+                "(Reason=JobArrayTaskLimit)."
+            )
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.JOB_ARRAY_TASK_LIMIT.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary=ev,
+                    details=ev,
+                    evidence=[ev],
+                )
+            )
+        elif reason_low == "partitionconfig":
+            static_issues: list[str] = []
+            for pf in policy_findings:
+                if pf.summary not in static_issues:
+                    static_issues.append(pf.summary)
+            for a in assessments:
+                if a.statically_eligible == TriState.FAIL:
+                    for n_str in a.notes:
+                        if n_str not in static_issues:
+                            static_issues.append(n_str)
+
+            if static_issues:
+                summary_str = (
+                    "SLURM reports a partition-configuration problem (Reason=PartitionConfig); "
+                    f"visible static incompatibility: {'; '.join(static_issues)}"
+                )
+                details_str = "; ".join(static_issues)
+                ev_list = list(static_issues)
+            else:
+                summary_str = (
+                    "SLURM reports a partition-configuration problem (Reason=PartitionConfig), "
+                    "but the exact configuration mismatch could not be established from visible SLURM information."
+                )
+                details_str = (
+                    "Visible partition MaxTime, QoS, and candidate-node static capacities "
+                    "appear compatible, and account hierarchy compatibility could not be proven to fail; "
+                    "the exact partition configuration mismatch remains unknown."
+                    if account_fit == TriState.UNKNOWN
+                    else (
+                        "Visible partition MaxTime, Account/QoS policies, and candidate-node static capacities "
+                        "appear compatible; the exact partition configuration mismatch remains unknown."
+                    )
+                )
+                ev_list = [f"Reason={job.reason}, Partition={job.partition}"]
+
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.PARTITION_CONFIG_BLOCK.value,
+                    confidence=Confidence.CONFIRMED.value,
+                    summary=summary_str,
+                    details=details_str,
+                    evidence=ev_list,
+                )
+            )
+            if failed_dep_finding is not None:
+                findings.append(failed_dep_finding)
+            findings.extend(policy_findings)
+            findings.extend(non_shortage_node_findings)
+            if not static_issues:
+                findings.append(
+                    DiagnosisFinding(
+                        code=DiagnosisCode.EXACT_BLOCKER_UNKNOWN.value,
+                        confidence=Confidence.POSSIBLE.value,
+                        summary="Exact partition configuration mismatch could not be determined from available SLURM information.",
+                        details=details_str,
+                        evidence=ev_list,
+                    )
+                )
+            return (
+                findings,
+                qos_fit,
+                account_fit,
+                time_limit_fit,
+                TriState.UNKNOWN,
+            )
+
+        # Additional independent hard blocker (e.g. failed dependency alongside hold/dependency/array reason)
+        if failed_dep_finding is not None:
+            findings.append(failed_dep_finding)
+
+        # Secondary context for JobHeldAdmin, JobHeldUser, Dependency, JobArrayTaskLimit
+        findings.extend(policy_findings)
+        for nf in non_shortage_node_findings:
+            if nf.code != DiagnosisCode.NO_STATICALLY_ELIGIBLE_NODE.value:
+                nf = DiagnosisFinding(
+                    code=nf.code,
+                    confidence=Confidence.SUPPORTED.value,
+                    summary=f"Secondary context: {nf.summary}",
+                    details=nf.details,
+                    evidence=nf.evidence,
+                )
+            findings.append(nf)
+        if fitting_now:
+            fit_names = ", ".join(a.node_name for a in fitting_now)
+            verb = "satisfies" if len(fitting_now) == 1 else "satisfy"
+            ev_fit = [
+                f"{a.node_name} currently has {a.node.gpu_free}/{a.node.gpu_total} free GPU(s), "
+                f"{a.node.cpu_free} free CPUs, and {format_memory_mb(a.node.memory_free_mb)} free memory."
+                for a in fitting_now
+            ]
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.RESOURCE_FIT_BUT_PENDING.value,
+                    confidence=Confidence.SUPPORTED.value,
+                    summary=(
+                        f"Secondary context: {fit_names} currently {verb} the resource request, "
+                        f"though the job cannot start until Reason={reason_clean} is resolved."
+                    ),
+                    details="; ".join(ev_fit),
+                    evidence=ev_fit,
+                )
+            )
+        planned_secondary = [a for a in eligible if a.is_planned]
+        if planned_secondary:
+            p_names = ", ".join(a.node_name for a in planned_secondary)
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.NODE_PLANNED.value,
+                    confidence=Confidence.SUPPORTED.value,
+                    summary=f"Secondary context: candidate node(s) {p_names} currently have PLANNED state.",
+                    details="; ".join(f"{a.node_name}: State={a.node.state_raw}" for a in planned_secondary),
+                    evidence=[f"{a.node_name}: State={a.node.state_raw}" for a in planned_secondary],
+                )
+            )
+        return (
+            findings,
+            qos_fit,
+            account_fit,
+            time_limit_fit,
+            TriState.UNKNOWN,
+        )
+
+    findings.extend(policy_findings)
+    findings.extend(node_and_res_findings)
+    if failed_dep_finding is not None:
+        findings.append(failed_dep_finding)
+
+    # If evaluating an alternative partition, do NOT use the original job's
+    # Reason, SchedNodeList, or StartTime to claim what would happen there.
+    if is_alternative_partition:
+        planned_in_alt = [a for a in eligible if a.is_planned]
+        if planned_in_alt:
+            names = ", ".join(a.node_name for a in planned_in_alt)
+            findings.append(
+                DiagnosisFinding(
+                    code=DiagnosisCode.NODE_PLANNED.value,
+                    confidence=Confidence.SUPPORTED.value,
+                    summary=f"Candidate node(s) {names} in partition '{partition.name if partition else ''}' have PLANNED state.",
+                    details=f"Nodes {names} have future scheduled allocations.",
+                    evidence=[f"{a.node_name}: {a.node.state_raw}" for a in planned_in_alt],
+                )
+            )
+        return (
+            findings,
+            qos_fit,
+            account_fit,
+            time_limit_fit,
+            TriState.UNKNOWN,
+        )
+
+    # Layer 3: Scheduler availability for PENDING jobs in their submitted partition
+    ref_time = _infer_reference_time(snapshot, job)
+
+    # Effective StartTime and SchedNodeList (from job snapshot or squeue --start)
+    eff_start_dt = job.start_time
+    eff_start_raw = job.start_time_raw
+    if eff_start_dt is None and snapshot.squeue_start_info.get("start_time"):
+        sq_st = snapshot.squeue_start_info["start_time"]
+        eff_start_dt = parse_slurm_datetime(sq_st)
+        if eff_start_dt is not None:
+            eff_start_raw = sq_st
+
+    eff_sched_nodes = list(job.sched_node_list)
+    if not eff_sched_nodes and snapshot.squeue_start_info.get("sched_nodes"):
+        eff_sched_nodes = expand_nodelist(
+            snapshot.squeue_start_info["sched_nodes"]
+        )
+
+    # Check if at least one candidate node physically fits right now while job is PENDING
+    if fitting_now and job.state.upper() == "PENDING":
+        fit_names = ", ".join(a.node_name for a in fitting_now)
+        verb = "satisfies" if len(fitting_now) == 1 else "satisfy"
+        ev = [
+            f"{a.node_name} currently has {a.node.gpu_free}/{a.node.gpu_total} free GPU(s), "
+            f"{a.node.cpu_free} free CPUs, and {format_memory_mb(a.node.memory_free_mb)} free memory."
+            for a in fitting_now
+        ]
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.RESOURCE_FIT_BUT_PENDING.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=f"{fit_names} currently {verb} the full resource request.",
+                details="; ".join(ev),
+                evidence=ev,
+            )
+        )
+
+    # Check scheduled future start
+    if eff_start_dt is not None or eff_sched_nodes:
+        node_desc = (
+            f" on {', '.join(eff_sched_nodes)}" if eff_sched_nodes else ""
+        )
+        time_desc = (
+            f" at {format_datetime(eff_start_dt, eff_start_raw)}"
+            if eff_start_dt is not None
+            else ""
+        )
+        ev = f"SLURM has scheduled the job{node_desc}{time_desc}."
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.SCHEDULED_FUTURE_START.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary=ev,
+                details=ev,
+                evidence=[ev],
+            )
+        )
+
+    # Check Reason=Priority
+    reason_clean = (job.reason or "").strip()
+    if reason_clean.lower() == "priority":
+        prio_ev: list[str] = [f"SLURM reports Reason=Priority (Priority={job.priority if job.priority is not None else 'Unknown'})."]
+        if snapshot.priority_info is not None:
+            pi = snapshot.priority_info
+            prio_ev.append(
+                f"sprio components: priority={pi.priority}, age={pi.age}, fairshare={pi.fairshare}, qos={pi.qos}"
+            )
+        higher_comps = [
+            c
+            for c in snapshot.competitor_jobs
+            if c.priority is not None
+            and job.priority is not None
+            and c.priority > job.priority
+        ]
+        if higher_comps:
+            prio_ev.append(
+                f"{len(higher_comps)} higher-priority pending job(s) observed in partition '{job.partition}'."
+            )
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.PRIORITY_WAIT.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary="Job is waiting behind higher-priority jobs in the queue (Reason=Priority).",
+                details="; ".join(prio_ev),
+                evidence=prio_ev,
+            )
+        )
+
+    # Check PLANNED and competitor jobs
+    planned_findings = _evaluate_planned_and_competitors(
+        job,
+        eligible,
+        snapshot.competitor_jobs,
+        ref_time,
+        eff_sched_nodes,
+    )
+    findings.extend(planned_findings)
+
+    # Check reservations
+    resv_conflict, resv_findings = _evaluate_reservations(
+        job,
+        eligible,
+        snapshot.reservations,
+        ref_time,
+    )
+    findings.extend(resv_findings)
+
+    # Check Reason=None
+    if reason_clean.lower() == "none" and job.state.upper() == "PENDING":
+        ev = "SLURM currently reports Reason=None while the job is PENDING."
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.REASON_NONE_TRANSIENT.value,
+                confidence=Confidence.CONFIRMED.value,
+                summary="SLURM currently gives no specific pending reason (Reason=None).",
+                details=ev,
+                evidence=[ev],
+            )
+        )
+
+    # Determine if the exact blocker remains unknown
+    concrete_blocker_codes = {
+        DiagnosisCode.NO_STATICALLY_ELIGIBLE_NODE.value,
+        DiagnosisCode.CURRENT_GPU_SHORTAGE.value,
+        DiagnosisCode.CURRENT_CPU_SHORTAGE.value,
+        DiagnosisCode.CURRENT_MEMORY_SHORTAGE.value,
+        DiagnosisCode.CURRENT_MULTIPLE_RESOURCE_SHORTAGES.value,
+        DiagnosisCode.NODE_DRAINED.value,
+        DiagnosisCode.NODE_DOWN.value,
+        DiagnosisCode.NODE_NOT_RESPONDING.value,
+        DiagnosisCode.NODE_MAINTENANCE.value,
+        DiagnosisCode.NODE_PLANNED.value,
+        DiagnosisCode.PARTITION_TIME_LIMIT_EXCEEDED.value,
+        DiagnosisCode.ACCOUNT_NOT_ALLOWED.value,
+        DiagnosisCode.QOS_NOT_ALLOWED.value,
+        DiagnosisCode.PRIORITY_WAIT.value,
+        DiagnosisCode.RESERVATION_OVERLAP.value,
+        DiagnosisCode.FUTURE_SCHEDULED_JOB_CONFLICT.value,
+        DiagnosisCode.SCHEDULED_FUTURE_START.value,
+    }
+    present_codes = {f.code for f in findings}
+    if job.state.upper() == "PENDING" and not (
+        present_codes & concrete_blocker_codes
+    ):
+        findings.append(
+            DiagnosisFinding(
+                code=DiagnosisCode.EXACT_BLOCKER_UNKNOWN.value,
+                confidence=Confidence.POSSIBLE.value,
+                summary="Exact blocker could not be determined from available SLURM information.",
+                details=(
+                    "Available user-visible SLURM state does not identify a concrete "
+                    "resource shortage, policy violation, reservation conflict, or scheduled start."
+                ),
+                evidence=[
+                    f"JobState={job.state}, Reason={job.reason or 'Unknown'}"
+                ],
+            )
+        )
+
+    return (
+        findings,
+        qos_fit,
+        account_fit,
+        time_limit_fit,
+        resv_conflict,
+    )
+
+
+# ============================================================================
+# 11. recommendation rules
+# ============================================================================
+
+
+def build_recommendations(
+    findings: list[DiagnosisFinding],
+    assessments: list[CandidateNodeAssessment],
+    job: JobInfo,
+    is_alternative_partition: bool = False,
+) -> list[Recommendation]:
+    """
+    Generate evidence-backed recommendations strictly derived from the
+    observed diagnosis findings and candidate-node assessments.
+    """
+    codes_present = {f.code for f in findings}
+    recs: list[Recommendation] = []
+    seen_codes: set[str] = set()
+
+    def _add(code: RecommendationCode, text: str, reasons: list[str]) -> None:
+        if code.value not in seen_codes:
+            seen_codes.add(code.value)
+            recs.append(
+                Recommendation(
+                    code=code.value,
+                    text=text,
+                    reason_codes=reasons,
+                )
+            )
+
+    # 1. RUNNING job: no pending actions required
+    if DiagnosisCode.JOB_ALREADY_RUNNING.value in codes_present:
+        _add(
+            RecommendationCode.KEEP_CURRENT_REQUEST,
+            "Job is already running; no scheduling action needed.",
+            [DiagnosisCode.JOB_ALREADY_RUNNING.value],
+        )
+        return recs
+
+    # 1b. Explicit non-resource holds, dependencies, and array task limits
+    if DiagnosisCode.JOB_HELD_ADMIN.value in codes_present:
+        _add(
+            RecommendationCode.RELEASE_HOLD,
+            "The administrative hold must be released before the job can run.",
+            [DiagnosisCode.JOB_HELD_ADMIN.value],
+        )
+        _add(
+            RecommendationCode.CHECK_CLUSTER_POLICY,
+            "Contact the relevant cluster administrator if the reason for the hold is unclear.",
+            [DiagnosisCode.JOB_HELD_ADMIN.value],
+        )
+        if DiagnosisCode.DEPENDENCY_FAILED.value in codes_present:
+            _add(
+                RecommendationCode.REVIEW_FAILED_DEPENDENCY,
+                "The failed dependency must also be reviewed/resolved; releasing the hold alone will not make the job runnable.",
+                [DiagnosisCode.DEPENDENCY_FAILED.value],
+            )
+        return recs
+
+    if DiagnosisCode.JOB_HELD_USER.value in codes_present:
+        _add(
+            RecommendationCode.RELEASE_HOLD,
+            "Release the user hold outside jobdiag before the job can be scheduled.",
+            [DiagnosisCode.JOB_HELD_USER.value],
+        )
+        if DiagnosisCode.DEPENDENCY_FAILED.value in codes_present:
+            _add(
+                RecommendationCode.REVIEW_FAILED_DEPENDENCY,
+                "The failed dependency must also be reviewed/resolved; releasing the hold alone will not make the job runnable.",
+                [DiagnosisCode.DEPENDENCY_FAILED.value],
+            )
+        return recs
+
+    if DiagnosisCode.DEPENDENCY_WAIT.value in codes_present:
+        if DiagnosisCode.DEPENDENCY_FAILED.value in codes_present:
+            _add(
+                RecommendationCode.REVIEW_FAILED_DEPENDENCY,
+                "Review or resolve the failed dependency outside jobdiag; the failed dependency condition cannot be satisfied by waiting.",
+                [DiagnosisCode.DEPENDENCY_FAILED.value],
+            )
+            return recs
+        dep_note = f" ({job.dependency_raw})" if job.dependency_raw else ""
+        _add(
+            RecommendationCode.WAIT_FOR_DEPENDENCY,
+            f"Wait for the job dependency condition{dep_note} to be satisfied.",
+            [DiagnosisCode.DEPENDENCY_WAIT.value],
+        )
+        _add(
+            RecommendationCode.KEEP_CURRENT_REQUEST,
+            "Keep the current resource request; free node capacity cannot start the job while its dependency is unfulfilled.",
+            [DiagnosisCode.DEPENDENCY_WAIT.value],
+        )
+        return recs
+
+    if DiagnosisCode.DEPENDENCY_FAILED.value in codes_present:
+        _add(
+            RecommendationCode.REVIEW_FAILED_DEPENDENCY,
+            "Review or resolve the failed dependency outside jobdiag; the failed dependency condition cannot be satisfied.",
+            [DiagnosisCode.DEPENDENCY_FAILED.value],
+        )
+
+    if DiagnosisCode.JOB_ARRAY_TASK_LIMIT.value in codes_present:
+        _add(
+            RecommendationCode.WAIT_FOR_ARRAY_TASKS,
+            "Wait for currently running tasks in this job array to finish.",
+            [DiagnosisCode.JOB_ARRAY_TASK_LIMIT.value],
+        )
+        _add(
+            RecommendationCode.REVIEW_ARRAY_CONCURRENCY,
+            "Or review the job-array concurrency configuration outside jobdiag.",
+            [DiagnosisCode.JOB_ARRAY_TASK_LIMIT.value],
+        )
+        return recs
+
+    # 2. Hard partition policy or static incompatibilities
+    if DiagnosisCode.PARTITION_TIME_LIMIT_EXCEEDED.value in codes_present:
+        _add(
+            RecommendationCode.SHORTEN_TIMELIMIT_IF_REALISTIC,
+            "Shorten the requested TimeLimit to fit within the partition MaxTime if realistic.",
+            [DiagnosisCode.PARTITION_TIME_LIMIT_EXCEEDED.value],
+        )
+        _add(
+            RecommendationCode.USE_OTHER_PARTITION,
+            "Or submit to a partition that supports a longer MaxTime.",
+            [DiagnosisCode.PARTITION_TIME_LIMIT_EXCEEDED.value],
+        )
+
+    if (
+        DiagnosisCode.ACCOUNT_NOT_ALLOWED.value in codes_present
+        or DiagnosisCode.QOS_NOT_ALLOWED.value in codes_present
+    ):
+        policy_reasons = [
+            c
+            for c in (
+                DiagnosisCode.ACCOUNT_NOT_ALLOWED.value,
+                DiagnosisCode.QOS_NOT_ALLOWED.value,
+            )
+            if c in codes_present
+        ]
+        _add(
+            RecommendationCode.CHECK_CLUSTER_POLICY,
+            "Check partition Account/QoS permissions or specify an allowed Account/QoS.",
+            policy_reasons,
+        )
+        _add(
+            RecommendationCode.USE_OTHER_PARTITION,
+            "Or choose a partition where your Account and QoS are permitted.",
+            policy_reasons,
+        )
+
+    if DiagnosisCode.NO_STATICALLY_ELIGIBLE_NODE.value in codes_present:
+        ineligible_classes = {a.classification for a in assessments}
+        if ineligible_classes & {
+            NodeClassification.INELIGIBLE_NODE_LIST.value,
+            NodeClassification.INELIGIBLE_CONSTRAINT.value,
+            NodeClassification.INELIGIBLE_GPU_TYPE.value,
+        }:
+            _add(
+                RecommendationCode.REVIEW_NODE_CONSTRAINT,
+                "Review ReqNodeList, ExcNodeList, feature constraints, or GPU type requirements.",
+                [DiagnosisCode.NO_STATICALLY_ELIGIBLE_NODE.value],
+            )
+        if (
+            NodeClassification.INELIGIBLE_TOTAL_MEMORY_CAPACITY.value
+            in ineligible_classes
+        ):
+            _add(
+                RecommendationCode.REDUCE_MEMORY_IF_SAFE,
+                "Requested memory exceeds total node capacity; reduce memory request if safe.",
+                [DiagnosisCode.NO_STATICALLY_ELIGIBLE_NODE.value],
+            )
+        if (
+            NodeClassification.INELIGIBLE_TOTAL_CPU_CAPACITY.value
+            in ineligible_classes
+        ):
+            _add(
+                RecommendationCode.REDUCE_CPU_IF_SAFE,
+                "Requested CPUs exceed total node capacity; reduce CPU request if safe.",
+                [DiagnosisCode.NO_STATICALLY_ELIGIBLE_NODE.value],
+            )
+        if (
+            NodeClassification.INELIGIBLE_TOTAL_GPU_CAPACITY.value
+            in ineligible_classes
+        ):
+            _add(
+                RecommendationCode.REDUCE_GPU_IF_APPLICATION_SUPPORTS,
+                "Requested GPUs per node exceed node GPU capacity; reduce per-node GPU count if supported.",
+                [DiagnosisCode.NO_STATICALLY_ELIGIBLE_NODE.value],
+            )
+        _add(
+            RecommendationCode.USE_OTHER_PARTITION,
+            "Or consider another partition with compatible node hardware.",
+            [DiagnosisCode.NO_STATICALLY_ELIGIBLE_NODE.value],
+        )
+        return recs
+
+    if DiagnosisCode.PARTITION_CONFIG_BLOCK.value in codes_present:
+        _add(
+            RecommendationCode.CHECK_CLUSTER_POLICY,
+            "Review the job's requested partition limits and hardware constraints against the partition configuration.",
+            [DiagnosisCode.PARTITION_CONFIG_BLOCK.value],
+        )
+        _add(
+            RecommendationCode.USE_OTHER_PARTITION,
+            "Or consider submitting to a partition compatible with the requested configuration.",
+            [DiagnosisCode.PARTITION_CONFIG_BLOCK.value],
+        )
+        return recs
+
+    # 3. Scheduled future start: suppress unnecessary resource-reduction advice
+    if DiagnosisCode.SCHEDULED_FUTURE_START.value in codes_present:
+        _add(
+            RecommendationCode.KEEP_CURRENT_REQUEST,
+            "Keep the current request.",
+            [DiagnosisCode.SCHEDULED_FUTURE_START.value],
+        )
+        _add(
+            RecommendationCode.WAIT,
+            "Wait for the scheduled start.",
+            [DiagnosisCode.SCHEDULED_FUTURE_START.value],
+        )
+        return recs
+
+    # 4. Priority wait: do NOT recommend arbitrary resource reductions
+    if DiagnosisCode.PRIORITY_WAIT.value in codes_present and not (
+        codes_present
+        & {
+            DiagnosisCode.PARTITION_TIME_LIMIT_EXCEEDED.value,
+            DiagnosisCode.ACCOUNT_NOT_ALLOWED.value,
+            DiagnosisCode.QOS_NOT_ALLOWED.value,
+        }
+    ):
+        _add(
+            RecommendationCode.KEEP_CURRENT_REQUEST,
+            "Keep the current request; job is queued waiting on priority.",
+            [DiagnosisCode.PRIORITY_WAIT.value],
+        )
+        _add(
+            RecommendationCode.WAIT,
+            "Wait for higher-priority jobs ahead in the queue to finish.",
+            [DiagnosisCode.PRIORITY_WAIT.value],
+        )
+        return recs
+
+    # 5. Future scheduled job conflict or reservation overlap
+    if (
+        DiagnosisCode.FUTURE_SCHEDULED_JOB_CONFLICT.value in codes_present
+        or DiagnosisCode.RESERVATION_OVERLAP.value in codes_present
+    ):
+        window_reasons = [
+            c
+            for c in (
+                DiagnosisCode.FUTURE_SCHEDULED_JOB_CONFLICT.value,
+                DiagnosisCode.RESERVATION_OVERLAP.value,
+            )
+            if c in codes_present
+        ]
+        _add(
+            RecommendationCode.SHORTEN_TIMELIMIT_IF_REALISTIC,
+            "Shorten the requested TimeLimit if the workload can finish within the available window before the future allocation.",
+            window_reasons,
+        )
+        _add(
+            RecommendationCode.WAIT,
+            "Otherwise wait for the scheduled allocation or reservation window to clear.",
+            window_reasons,
+        )
+
+    # 6. Specific current resource bottlenecks
+    if DiagnosisCode.CURRENT_MEMORY_SHORTAGE.value in codes_present:
+        _add(
+            RecommendationCode.REDUCE_MEMORY_IF_SAFE,
+            "Reduce requested memory if safe for the workload, as memory is the current per-node bottleneck.",
+            [DiagnosisCode.CURRENT_MEMORY_SHORTAGE.value],
+        )
+        _add(
+            RecommendationCode.WAIT,
+            "Or wait for running jobs to release memory on candidate nodes.",
+            [DiagnosisCode.CURRENT_MEMORY_SHORTAGE.value],
+        )
+
+    if DiagnosisCode.CURRENT_CPU_SHORTAGE.value in codes_present:
+        _add(
+            RecommendationCode.REDUCE_CPU_IF_SAFE,
+            "Reduce requested CPUs if safe for the workload, as CPU count is the current per-node bottleneck.",
+            [DiagnosisCode.CURRENT_CPU_SHORTAGE.value],
+        )
+        _add(
+            RecommendationCode.WAIT,
+            "Or wait for running jobs to release CPUs on candidate nodes.",
+            [DiagnosisCode.CURRENT_CPU_SHORTAGE.value],
+        )
+
+    if DiagnosisCode.CURRENT_GPU_SHORTAGE.value in codes_present:
+        eligible_sched = [
+            a
+            for a in assessments
+            if a.statically_eligible != TriState.FAIL
+            and a.node_schedulable == TriState.PASS
+        ]
+        has_partial_free_gpu = (
+            job.request.gpu_count > 1
+            and any(
+                a.node.gpu_free is not None
+                and 0 < a.node.gpu_free < job.request.gpu_count
+                for a in eligible_sched
+            )
+        )
+        if has_partial_free_gpu:
+            _add(
+                RecommendationCode.REDUCE_GPU_IF_APPLICATION_SUPPORTS,
+                "Reduce per-node GPU count if the application supports fewer GPUs, as candidate node(s) have partial free GPUs.",
+                [DiagnosisCode.CURRENT_GPU_SHORTAGE.value],
+            )
+        _add(
+            RecommendationCode.WAIT,
+            "Wait for running GPU jobs to complete on a candidate node.",
+            [DiagnosisCode.CURRENT_GPU_SHORTAGE.value],
+        )
+
+    if DiagnosisCode.CURRENT_MULTIPLE_RESOURCE_SHORTAGES.value in codes_present:
+        _add(
+            RecommendationCode.WAIT,
+            "Wait for currently running jobs to release resources on candidate nodes.",
+            [DiagnosisCode.CURRENT_MULTIPLE_RESOURCE_SHORTAGES.value],
+        )
+
+    # 7. Unschedulable node states (DRAIN, DOWN, NOT_RESPONDING, MAINT)
+    unsched_codes = [
+        c
+        for c in (
+            DiagnosisCode.NODE_DRAINED.value,
+            DiagnosisCode.NODE_DOWN.value,
+            DiagnosisCode.NODE_NOT_RESPONDING.value,
+            DiagnosisCode.NODE_MAINTENANCE.value,
+        )
+        if c in codes_present
+    ]
+    if unsched_codes:
+        eligible_sched = [
+            a
+            for a in assessments
+            if a.statically_eligible != TriState.FAIL
+            and a.node_schedulable == TriState.PASS
+        ]
+        if not eligible_sched:
+            _add(
+                RecommendationCode.WAIT_FOR_NODE_RECOVERY,
+                "Wait for drained/down candidate node(s) to recover and return to service.",
+                unsched_codes,
+            )
+            if job.request.req_nodes:
+                _add(
+                    RecommendationCode.REVIEW_NODE_CONSTRAINT,
+                    "Or relax ReqNodeList if other healthy nodes in the partition can run the job.",
+                    unsched_codes,
+                )
+            else:
+                _add(
+                    RecommendationCode.USE_OTHER_PARTITION,
+                    "Or consider an alternative partition with healthy nodes.",
+                    unsched_codes,
+                )
+        elif job.request.req_nodes:
+            _add(
+                RecommendationCode.REVIEW_NODE_CONSTRAINT,
+                "Consider reviewing ReqNodeList since one or more requested nodes are currently unavailable.",
+                unsched_codes,
+            )
+
+    if not recs:
+        _add(
+            RecommendationCode.WAIT,
+            "Wait for the next scheduler evaluation cycle.",
+            list(codes_present),
+        )
+
+    return recs
+
+
+# ============================================================================
+# 12. report assembly
+# ============================================================================
+
+
+def build_diagnosis_report(
+    snapshot: AcquisitionSnapshot,
+    evaluation_partition_override: str | None = None,
+) -> DiagnosisReport:
+    if snapshot.job_snapshot_b is not None and not snapshot.changed_fields:
+        changed = compare_job_snapshots(
+            snapshot.job_snapshot_a, snapshot.job_snapshot_b
+        )
+        if changed:
+            snapshot.snapshot_changed = True
+            snapshot.changed_fields = changed
+
+    job = snapshot.job_snapshot_b or snapshot.job_snapshot_a
+    submitted_part = job.partition
+    eval_part_name = evaluation_partition_override or submitted_part
+    active_partitions = (
+        snapshot.evaluation_partitions
+        if snapshot.evaluation_partitions
+        else snapshot.submitted_partitions
+    )
+    partition = snapshot.evaluation_partition or snapshot.submitted_partition
+    is_alt = bool(
+        evaluation_partition_override
+        and evaluation_partition_override != submitted_part
+    )
+
+    # Evaluate candidate nodes:
+    # For a RUNNING job (without alternative partition evaluation), do NOT evaluate
+    # current remaining free resources as if the job were still waiting to be scheduled,
+    # because the job's own allocation is already included in the node's AllocTRES.
+    assessments: list[CandidateNodeAssessment] = []
+    if not (job.state.upper() == "RUNNING" and not is_alt):
+        candidate_names: list[str] = []
+        seen: set[str] = set()
+        if job.request.req_nodes and not is_alt:
+            for n in sorted(job.request.req_nodes):
+                if n in snapshot.nodes and n not in seen:
+                    seen.add(n)
+                    candidate_names.append(n)
+        for n in sorted(snapshot.nodes.keys()):
+            if n not in seen:
+                if (
+                    not is_alt
+                    and job.request.req_nodes
+                    and n not in job.request.req_nodes
+                ):
+                    continue
+                seen.add(n)
+                candidate_names.append(n)
+
+        part_arg: PartitionInfo | dict[str, PartitionInfo] | None = (
+            active_partitions if active_partitions else partition
+        )
+        assessments = [
+            assess_candidate_node(job.request, snapshot.nodes[name], part_arg)
+            for name in candidate_names
+        ]
+
+    findings, qos_fit, account_fit, time_limit_fit, resv_conflict = (
+        run_diagnosis_rules(
+            snapshot,
+            assessments,
+            is_alternative_partition=is_alt,
+        )
+    )
+    recommendations = build_recommendations(
+        findings, assessments, job, is_alternative_partition=is_alt
+    )
+
+    return DiagnosisReport(
+        job=job,
+        submitted_partition_name=submitted_part,
+        evaluation_partition_name=eval_part_name,
+        partition=partition,
+        partitions=dict(active_partitions),
+        node_assessments=assessments,
+        findings=findings,
+        recommendations=recommendations,
+        snapshot=snapshot,
+        qos_fit=qos_fit,
+        account_fit=account_fit,
+        time_limit_fit=time_limit_fit,
+        reservation_conflict=resv_conflict,
+    )
+
+
+def collect_and_diagnose(
+    job_id: str,
+    partition_override: str | None = None,
+    runner: CommandRunner = execute_slurm_command,
+    reference_time: datetime | None = None,
+) -> tuple[DiagnosisReport | None, str | None]:
+    """
+    Progressive SLURM data acquisition across Tiers 1-4 with mandatory
+    Snapshot A / Snapshot B consistency verification.
+    """
+    commands_run: list[str] = []
+    skipped_queries: list[str] = []
+    warnings: list[str] = []
+
+    # --- Tier 1: Target job (Snapshot A), partition(s), candidate nodes, node resources ---
+    job_a, err = acquire_job_snapshot(
+        job_id, runner=runner, commands_run=commands_run
+    )
+    if job_a is None:
+        return None, err
+
+    submitted_part_name = job_a.partition
+    eval_part_name = partition_override or submitted_part_name
+    submitted_part_names = job_a.partitions or parse_partition_list(submitted_part_name)
+    eval_part_names = (
+        parse_partition_list(partition_override)
+        if partition_override
+        else list(submitted_part_names)
+    )
+    is_alt_part = bool(
+        partition_override
+        and parse_partition_list(partition_override) != submitted_part_names
+    )
+
+    submitted_parts: dict[str, PartitionInfo] = {}
+    for p_name in submitted_part_names:
+        p_info, part_err = acquire_partition(
+            p_name, runner=runner, commands_run=commands_run
+        )
+        if p_info is not None:
+            submitted_parts[p_name] = p_info
+        if part_err:
+            warnings.append(part_err)
+
+    submitted_part = (
+        next(iter(submitted_parts.values())) if submitted_parts else None
+    )
+
+    eval_parts: dict[str, PartitionInfo] = {}
+    if is_alt_part:
+        for p_name in eval_part_names:
+            p_info, eval_err = acquire_partition(
+                p_name, runner=runner, commands_run=commands_run
+            )
+            if eval_err or p_info is None:
+                return None, eval_err or f"Could not retrieve partition '{p_name}'."
+            eval_parts[p_name] = p_info
+    else:
+        eval_parts = dict(submitted_parts)
+
+    eval_part = next(iter(eval_parts.values())) if eval_parts else None
+
+    part_nodes: list[str] = []
+    seen_part_nodes: set[str] = set()
+    for p_name in eval_part_names:
+        p_info = eval_parts.get(p_name)
+        p_nodes = acquire_partition_nodes(
+            p_name,
+            p_info,
+            runner=runner,
+            commands_run=commands_run,
+            warnings=warnings,
+        )
+        if p_info is not None and not p_info.nodes and p_nodes:
+            p_info.nodes = list(p_nodes)
+        for n in p_nodes:
+            if n not in seen_part_nodes:
+                seen_part_nodes.add(n)
+                part_nodes.append(n)
+
+    nodes_to_query = list(part_nodes)
+    if not is_alt_part:
+        for extra_n in sorted(
+            job_a.request.req_nodes
+            | set(job_a.node_list)
+            | set(job_a.sched_node_list)
+        ):
+            if extra_n not in nodes_to_query:
+                nodes_to_query.append(extra_n)
+
+    nodes_map = acquire_nodes_details(
+        nodes_to_query,
+        runner=runner,
+        commands_run=commands_run,
+        warnings=warnings,
+    )
+
+    # Preliminary assessment to decide Tiers 2, 3, 4
+    if job_a.state.upper() == "RUNNING" and not is_alt_part:
+        prelim_assessments: list[CandidateNodeAssessment] = []
+        any_statically_eligible = True
+        any_fits_now = False
+        any_planned = False
+    else:
+        prelim_names = (
+            [n for n in sorted(job_a.request.req_nodes) if n in nodes_map]
+            if (job_a.request.req_nodes and not is_alt_part)
+            else sorted(nodes_map.keys())
+        )
+        prelim_part_arg: PartitionInfo | dict[str, PartitionInfo] | None = (
+            eval_parts if eval_parts else eval_part
+        )
+        prelim_assessments = [
+            assess_candidate_node(job_a.request, nodes_map[n], prelim_part_arg)
+            for n in prelim_names
+        ]
+        any_statically_eligible = any(
+            a.statically_eligible != TriState.FAIL for a in prelim_assessments
+        )
+        any_fits_now = any(
+            a.fits_now == TriState.PASS for a in prelim_assessments
+        )
+        any_planned = any(a.is_planned for a in prelim_assessments)
+
+    active_eval_parts = list(eval_parts.values())
+    time_limit_exceeded = bool(
+        active_eval_parts
+        and all(
+            _partition_permits_timelimit(p, job_a.request) == TriState.FAIL
+            for p in active_eval_parts
+        )
+    )
+    hard_static_incompatibility = (
+        not any_statically_eligible or time_limit_exceeded
+    )
+
+    squeue_start_info: dict[str, str] = {}
+    priority_info: PriorityInfo | None = None
+    reservations: list[ReservationInfo] = []
+    competitor_jobs: list[JobInfo] = []
+    pending_queue_summary: dict[str, int] = {}
+    skipped_arrays: list[str] = []
+    account_ancestors: set[str] = set()
+
+    reason_low = (job_a.reason or "").strip().lower()
+    explicit_non_scheduler_reasons = {
+        "jobheldadmin",
+        "jobhelduser",
+        "dependency",
+        "jobarraytasklimit",
+        "partitionconfig",
+    }
+
+    # --- Tier 2: squeue --start ---
+    if (
+        job_a.state.upper() == "PENDING"
+        and not is_alt_part
+        and not hard_static_incompatibility
+        and reason_low not in explicit_non_scheduler_reasons
+    ):
+        sq_cmd = f"squeue --start -j {shlex.quote(str(job_id))}"
+        commands_run.append(sq_cmd)
+        sq_res = runner(sq_cmd)
+        if sq_res.ok and sq_res.stdout.strip():
+            squeue_start_info = parse_squeue_start(
+                sq_res.stdout, target_job_id=str(job_id)
+            )
+    else:
+        skipped_queries.append("Tier 2: squeue --start")
+
+    # --- Tier 3: sprio, reservations, pending queue, relevant competitors ---
+    needs_tier3 = (
+        job_a.state.upper() == "PENDING"
+        and not is_alt_part
+        and reason_low not in explicit_non_scheduler_reasons
+        and (
+            reason_low in {"priority", "reqnodenotavail", "reservation", "none"}
+            or any_fits_now
+            or any_planned
+        )
+    )
+    if needs_tier3:
+        sprio_cmd = f"sprio -j {shlex.quote(str(job_id))}"
+        commands_run.append(sprio_cmd)
+        sprio_res = runner(sprio_cmd)
+        if sprio_res.ok and sprio_res.stdout.strip():
+            priority_info = parse_priority_info(
+                sprio_res.stdout, target_job_id=str(job_id)
+            )
+
+        resv_cmd = "scontrol show reservation"
+        commands_run.append(resv_cmd)
+        resv_res = runner(resv_cmd)
+        if resv_res.ok and resv_res.stdout.strip():
+            reservations = parse_reservations_output(resv_res.stdout)
+
+        pend_cmd = f"squeue -p {shlex.quote(submitted_part_name)} -t PENDING"
+        commands_run.append(pend_cmd)
+        pend_res = runner(pend_cmd)
+        if pend_res.ok and pend_res.stdout.strip():
+            inspectable, skipped_arr, reason_counts = parse_squeue_pending(
+                pend_res.stdout, target_job_id=str(job_id)
+            )
+            skipped_arrays.extend(skipped_arr)
+            pending_queue_summary = reason_counts
+            if skipped_arr:
+                warnings.append(
+                    f"Skipped {len(skipped_arr)} compressed job-array entry/entries in pending queue."
+                )
+
+            # Inspect up to 6 relevant competitor jobs
+            for entry in inspectable[:6]:
+                comp_id = entry["job_id"]
+                comp_job, _ = acquire_job_snapshot(
+                    comp_id, runner=runner, commands_run=commands_run
+                )
+                if comp_job is not None:
+                    competitor_jobs.append(comp_job)
+    else:
+        skipped_queries.append(
+            "Tier 3: sprio, reservations, and pending competitor queue"
+        )
+
+    # --- Tier 4: Optional sacctmgr for account/QoS hierarchy when relevant ---
+    acct_needs_resolution = False
+    if active_eval_parts and job_a.account:
+        base_candidates = resolve_account_ancestors(job_a.account, {})
+        any_part_allows_directly = any(
+            p.allow_accounts is not None
+            and (
+                "ALL" in p.allow_accounts
+                or bool(base_candidates & p.allow_accounts)
+            )
+            for p in active_eval_parts
+        )
+        any_part_restricts_accounts = any(
+            p.allow_accounts is not None and "ALL" not in p.allow_accounts
+            for p in active_eval_parts
+        )
+        if any_part_restricts_accounts and not any_part_allows_directly:
+            acct_needs_resolution = True
+
+    needs_tier4 = any(
+        tok in reason_low for tok in ("account", "qos", "assoc", "partitionconfig")
+    ) and (
+        acct_needs_resolution
+        or any(tok in reason_low for tok in ("account", "qos", "assoc"))
+    )
+    account_hierarchy_complete = False
+    if needs_tier4:
+        sacct_cmd = "sacctmgr show account format=Account,ParentName -n -p"
+        commands_run.append(sacct_cmd)
+        sacct_res = runner(sacct_cmd)
+        if sacct_res.ok and sacct_res.stdout.strip():
+            parent_map = parse_sacctmgr_accounts(sacct_res.stdout)
+            account_ancestors = resolve_account_ancestors(
+                job_a.account, parent_map
+            )
+            account_hierarchy_complete = "root" in account_ancestors
+        else:
+            account_ancestors = resolve_account_ancestors(job_a.account, {})
+    else:
+        account_ancestors = resolve_account_ancestors(job_a.account, {})
+        skipped_queries.append("Tier 4: sacctmgr show account")
+
+    # --- Snapshot B: Re-query target job for snapshot consistency (Section 12) ---
+    job_b, _ = acquire_job_snapshot(
+        job_id, runner=runner, commands_run=commands_run
+    )
+    changed_fields: list[str] = []
+    snapshot_changed = False
+    if job_b is not None:
+        changed_fields = compare_job_snapshots(job_a, job_b)
+        snapshot_changed = bool(changed_fields)
+        # If Snapshot B references any new nodes in the submitted partition, acquire their details
+        if not is_alt_part:
+            new_nodes = [
+                n
+                for n in sorted(
+                    job_b.request.req_nodes
+                    | set(job_b.node_list)
+                    | set(job_b.sched_node_list)
+                )
+                if n not in nodes_map
+            ]
+            if new_nodes:
+                nodes_map.update(
+                    acquire_nodes_details(
+                        new_nodes,
+                        runner=runner,
+                        commands_run=commands_run,
+                        warnings=warnings,
+                    )
+                )
+
+    snapshot = AcquisitionSnapshot(
+        job_snapshot_a=job_a,
+        job_snapshot_b=job_b,
+        submitted_partition=submitted_part,
+        evaluation_partition=eval_part,
+        submitted_partitions=submitted_parts,
+        evaluation_partitions=eval_parts,
+        nodes=nodes_map,
+        squeue_start_info=squeue_start_info,
+        priority_info=priority_info,
+        reservations=reservations,
+        competitor_jobs=competitor_jobs,
+        pending_queue_summary=pending_queue_summary,
+        skipped_array_entries=skipped_arrays,
+        account_ancestors=account_ancestors,
+        account_hierarchy_complete=account_hierarchy_complete,
+        snapshot_changed=snapshot_changed,
+        changed_fields=changed_fields,
+        commands_run=commands_run,
+        skipped_queries=skipped_queries,
+        warnings=warnings,
+        reference_time=reference_time,
+    )
+
+    report = build_diagnosis_report(
+        snapshot,
+        evaluation_partition_override=partition_override,
+    )
+    return report, None
+
+
+# ============================================================================
+# 13. Rich rendering
+# ============================================================================
+
+
+def render_report(
+    report: DiagnosisReport,
+    console: Console,
+    verbose: bool = False,
+) -> None:
+    job = report.job
+    is_alt_part = (
+        report.evaluation_partition_name != report.submitted_partition_name
+    )
+
+    state_upper = job.state.upper()
+    state_style = (
+        "bold green"
+        if state_upper == "RUNNING"
+        else "bold yellow"
+        if state_upper == "PENDING"
+        else "bold cyan"
+    )
+
+    header_lines: list[str] = []
+    if job.name:
+        header_lines.append(f"[bold]{job.name}[/bold]")
+    header_lines.append(f"State:     [{state_style}]{job.state}[/{state_style}]")
+    if not is_alt_part and job.reason:
+        header_lines.append(f"Reason:    {job.reason}")
+    if job.priority is not None:
+        header_lines.append(f"Priority:  {job.priority:,}")
+    if is_alt_part:
+        header_lines.append(
+            f"Submitted partition:  {report.submitted_partition_name}"
+        )
+        header_lines.append(
+            f"Evaluation partition: [bold cyan]{report.evaluation_partition_name}[/bold cyan]"
+        )
+    else:
+        header_lines.append(f"Partition: {report.submitted_partition_name}")
+
+    panel = Panel(
+        Text.from_markup("\n".join(header_lines)),
+        title=f"[bold]Job {job.job_id}[/bold]",
+        border_style="bright_cyan",
+        expand=False,
+    )
+    console.print(panel)
+    console.print()
+
+    # Request section
+    console.print("[bold underline]Request[/bold underline]")
+    req = job.request
+    req_table = Table(box=None, show_header=False, pad_edge=False)
+    req_table.add_column("Field", style="bold", width=10)
+    req_table.add_column("Value")
+
+    gpu_desc = str(req.gpu_count)
+    if req.gpu_type:
+        gpu_desc = f"{req.gpu_count} ({req.gpu_type})"
+    req_table.add_row("GPU", gpu_desc)
+    req_table.add_row(
+        "CPU", str(req.cpus) if req.cpus is not None else "Unknown"
+    )
+    req_table.add_row("Memory", format_memory_mb(req.memory_mb))
+    req_table.add_row("Nodes", str(req.nodes))
+    req_table.add_row(
+        "Time",
+        format_duration_seconds(
+            req.time_limit_seconds,
+            req.time_limit_raw,
+            req.time_limit_unlimited,
+        ),
+    )
+    if job.account:
+        req_table.add_row("Account", job.account)
+    if job.qos:
+        req_table.add_row("QoS", job.qos)
+    if req.req_nodes_raw:
+        req_table.add_row("NodeList", req.req_nodes_raw)
+    if req.exc_nodes_raw:
+        req_table.add_row("ExcNodes", req.exc_nodes_raw)
+    if req.constraints_raw:
+        req_table.add_row("Features", req.constraints_raw)
+    if job.dependency_raw:
+        req_table.add_row("Dependency", job.dependency_raw)
+    console.print(req_table)
+    console.print()
+
+    # RUNNING allocated-resource section vs PENDING Candidate Nodes section
+    if state_upper == "RUNNING" and not is_alt_part:
+        console.print("[bold underline]Allocated Resources[/bold underline]")
+        alloc_table = Table(box=None, show_header=False, pad_edge=False)
+        alloc_table.add_column("Field", style="bold", width=12)
+        alloc_table.add_column("Value")
+
+        assigned_nodes = (
+            ", ".join(job.node_list)
+            if job.node_list
+            else (job.node_list_raw or "Unknown")
+        )
+        alloc_table.add_row("Node", assigned_nodes)
+
+        alloc_g = (
+            job.allocated_gpus
+            if job.allocated_gpus is not None
+            else req.gpu_count
+        )
+        alloc_gtype = job.allocated_gpu_type or req.gpu_type
+        if not alloc_gtype and report.snapshot and job.node_list:
+            first_node = report.snapshot.nodes.get(job.node_list[0])
+            if first_node and first_node.gpu_type:
+                alloc_gtype = first_node.gpu_type
+        alloc_gpu_str = (
+            f"{alloc_g} ({alloc_gtype})"
+            if alloc_gtype and alloc_g > 0
+            else str(alloc_g)
+        )
+        alloc_table.add_row(
+            "GPU", f"{alloc_gpu_str} (requested: {gpu_desc})"
+        )
+
+        alloc_c = (
+            job.allocated_cpus if job.allocated_cpus is not None else req.cpus
+        )
+        req_c_str = str(req.cpus) if req.cpus is not None else "Unknown"
+        alloc_c_str = str(alloc_c) if alloc_c is not None else "Unknown"
+        alloc_table.add_row(
+            "CPU", f"{alloc_c_str} (requested: {req_c_str})"
+        )
+
+        alloc_m = (
+            job.allocated_memory_mb
+            if job.allocated_memory_mb is not None
+            else req.memory_mb
+        )
+        alloc_table.add_row(
+            "Memory",
+            f"{format_memory_mb(alloc_m)} (requested: {format_memory_mb(req.memory_mb)})",
+        )
+        alloc_table.add_row(
+            "Start time", format_datetime(job.start_time, job.start_time_raw)
+        )
+        if job.run_time_raw:
+            alloc_table.add_row("Run time", job.run_time_raw)
+        console.print(alloc_table)
+        console.print()
+    elif report.node_assessments:
+        console.print("[bold underline]Candidate Nodes[/bold underline]")
+        node_table = Table(
+            box=None,
+            show_header=True,
+            header_style="bold cyan",
+            pad_edge=False,
+        )
+        node_table.add_column("Node", width=10)
+        node_table.add_column("GPU", width=12)
+        node_table.add_column("CPU", width=11)
+        node_table.add_column("Memory", width=12)
+        node_table.add_column("State", width=26)
+        node_table.add_column("Fit", width=12)
+
+        for item in report.node_assessments:
+            n = item.node
+            gpu_str = (
+                f"{n.gpu_free}/{n.gpu_total} free"
+                if n.gpu_free is not None and n.gpu_total is not None
+                else "Unknown"
+            )
+            cpu_str = (
+                f"{n.cpu_free} free"
+                if n.cpu_free is not None
+                else "Unknown"
+            )
+            mem_str = (
+                f"{format_memory_mb(n.memory_free_mb)} free"
+                if n.memory_free_mb is not None
+                else "Unknown"
+            )
+            fit_label = (
+                "[green]YES[/green]"
+                if item.classification
+                == NodeClassification.ELIGIBLE_FITS_NOW.value
+                else "[yellow]PLANNED[/yellow]"
+                if item.classification
+                == NodeClassification.ELIGIBLE_PLANNED_REVIEW_REQUIRED.value
+                else "[red]NO[/red]"
+                if item.fits_now == TriState.FAIL
+                else "[dim]UNKNOWN[/dim]"
+            )
+            node_table.add_row(
+                n.name,
+                gpu_str,
+                cpu_str,
+                mem_str,
+                n.state_raw,
+                fit_label,
+            )
+        console.print(node_table)
+        console.print()
+
+    # Scheduler section
+    console.print("[bold underline]Scheduler[/bold underline]")
+    if is_alt_part:
+        console.print(
+            "Alternative partition evaluation: submitted job's Reason, StartTime, "
+            "and SchedNodeList are not applied to this partition."
+        )
+        if report.partitions and len(report.partitions) > 1:
+            part_limits = ", ".join(
+                f"{p.name}={format_duration_seconds(p.max_time_seconds, p.max_time_raw, p.max_time_unlimited)}"
+                for p in report.partitions.values()
+            )
+            console.print(f"Partition MaxTime: {part_limits}")
+        elif report.partition:
+            max_t = format_duration_seconds(
+                report.partition.max_time_seconds,
+                report.partition.max_time_raw,
+                report.partition.max_time_unlimited,
+            )
+            console.print(f"Partition MaxTime: {max_t}")
+    elif state_upper == "RUNNING":
+        assigned = (
+            ", ".join(job.node_list)
+            if job.node_list
+            else (job.node_list_raw or "Unknown")
+        )
+        console.print(f"Assigned node:  {assigned}")
+        console.print(
+            f"Start time:     {format_datetime(job.start_time, job.start_time_raw)}"
+        )
+        if job.run_time_raw:
+            console.print(f"Run time:       {job.run_time_raw}")
+    else:
+        eff_start = job.start_time
+        eff_start_raw = job.start_time_raw
+        eff_sched = list(job.sched_node_list)
+        if report.snapshot:
+            sq_info = report.snapshot.squeue_start_info
+            if eff_start is None and sq_info.get("start_time"):
+                eff_start = parse_slurm_datetime(sq_info["start_time"])
+                if eff_start is not None:
+                    eff_start_raw = sq_info["start_time"]
+            if not eff_sched and sq_info.get("sched_nodes"):
+                eff_sched = expand_nodelist(sq_info["sched_nodes"])
+
+        console.print(
+            f"Expected start: {format_datetime(eff_start, eff_start_raw)}"
+        )
+        console.print(
+            f"Scheduled node: {', '.join(eff_sched) if eff_sched else 'None'}"
+        )
+        if report.snapshot and report.snapshot.priority_info:
+            pi = report.snapshot.priority_info
+            console.print(
+                f"Priority breakdown: total={pi.priority}, age={pi.age}, "
+                f"fairshare={pi.fairshare}, qos={pi.qos}"
+            )
+    console.print()
+
+    # Diagnosis section
+    console.print("[bold underline]Diagnosis[/bold underline]")
+    if not report.findings:
+        console.print("No specific diagnostic findings.")
+    else:
+        for conf_level, label, symbol, style in (
+            (Confidence.CONFIRMED.value, "Confirmed", "✓", "green"),
+            (Confidence.SUPPORTED.value, "Supported", "•", "yellow"),
+            (Confidence.POSSIBLE.value, "Possible", "?", "dim"),
+        ):
+            group = [
+                f for f in report.findings if f.confidence == conf_level
+            ]
+            if not group:
+                continue
+            console.print(f"[bold]{label}[/bold]")
+            for finding in group:
+                console.print(
+                    f"[{style}]{symbol}[/{style}] {finding.summary}"
+                )
+    console.print()
+
+    # Recommendation section
+    if report.recommendations:
+        console.print("[bold underline]Recommendation[/bold underline]")
+        for rec in report.recommendations:
+            console.print(f"[cyan]→[/cyan] {rec.text}")
+        console.print()
+
+    # Verbose provenance & classification section
+    if verbose:
+        console.print("[bold underline]Verbose Details[/bold underline]")
+        console.print("[bold]Node Classifications:[/bold]")
+        if state_upper == "RUNNING" and not is_alt_part:
+            console.print(
+                "  (Not evaluated for RUNNING jobs; current node allocations already include this job.)"
+            )
+        for item in report.node_assessments:
+            part_str = (
+                f", partitions={','.join(item.matched_partitions)}"
+                if len(item.matched_partitions) > 1
+                or (
+                    report.partitions
+                    and len(report.partitions) > 1
+                    and item.matched_partitions
+                )
+                else ""
+            )
+            note_str = f" — {'; '.join(item.notes)}" if item.notes else ""
+            console.print(
+                f"  {item.node_name}: {item.classification} "
+                f"(static={item.statically_eligible.value}, fits_now={item.fits_now.value}{part_str}){note_str}"
+            )
+        console.print(
+            f"[bold]Policy Tri-States:[/bold] time_limit={report.time_limit_fit.value}, "
+            f"account={report.account_fit.value}, qos={report.qos_fit.value}, "
+            f"reservation_conflict={report.reservation_conflict.value}"
+        )
+        console.print("[bold]Diagnosis Codes:[/bold]")
+        for f in report.findings:
+            console.print(f"  {f.code} [{f.confidence}]: {f.details or f.summary}")
+        if report.snapshot:
+            snap = report.snapshot
+            if snap.commands_run:
+                console.print("[bold]Commands Executed:[/bold]")
+                for cmd in snap.commands_run:
+                    console.print(f"  $ {cmd}")
+            if snap.skipped_queries:
+                console.print("[bold]Skipped Optional Queries:[/bold]")
+                for sk in snap.skipped_queries:
+                    console.print(f"  - {sk}")
+            if snap.warnings:
+                console.print("[bold]Collection Notes / Warnings:[/bold]")
+                for w in snap.warnings:
+                    console.print(f"  ! {w}")
+        console.print()
+
+
+# ============================================================================
+# 14. CLI
+# ============================================================================
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="jobdiag",
+        description=(
+            "Read-only SLURM job diagnostics utility. Explains job state and "
+            "pending reasons, requested resources, candidate-node "
+            "compatibility, scheduler evidence, and actionable next steps."
+        ),
+    )
+    parser.add_argument(
+        "job_id",
+        metavar="JOBID",
+        help="SLURM job ID to diagnose.",
+    )
+    parser.add_argument(
+        "-p",
+        "--partition",
+        metavar="PARTITION",
+        default=None,
+        help=(
+            "Evaluate whether the job's resource request would be compatible "
+            "with an alternative partition."
+        ),
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show detailed provenance, raw fields, and classification notes.",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color and styling in terminal output.",
+    )
+    return parser
+
+
+# ============================================================================
+# 15. main()
+# ============================================================================
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    out_console = Console(no_color=args.no_color)
+
+    report, error = collect_and_diagnose(
+        str(args.job_id),
+        partition_override=args.partition,
+    )
+    if error or report is None:
+        out_console.print(f"[bold red]Error:[/bold red] {error}")
+        return 1
+
+    render_report(report, out_console, verbose=args.verbose)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
