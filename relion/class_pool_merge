@@ -1,0 +1,1112 @@
+#!/apps/strubi/software/packages/miniforge3/envs/miss-alignment/bin/python
+"""
+class_pool_merge
+
+Validate and merge RELION Class3D particle pools across multiple jobs using a
+declarative TOML configuration.
+
+Phase 2A foundation:
+    - CLI argument parsing (--config, --project-dir, --outdir, --dry-run)
+    - TOML configuration loading via standard-library tomllib
+    - Compact class range and integer list parsing
+    - Strict validation of pools, frozen-pool modes, and 1..K class partitions
+
+Developed and maintained by Long Chen.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import math
+from pathlib import Path
+import re
+import shlex
+import sys
+import tomllib
+from typing import Any
+
+import pandas as pd
+import starfile
+
+
+VALID_FROZEN_MODES = ("copy_only", "append")
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+RANGE_TOKEN_RE = re.compile(r"^(\d+)(?:\s*-\s*(\d+))?$")
+MODEL_CLASS_RE = re.compile(r"class0*(\d+)\.mrc$", re.IGNORECASE)
+STRING_ID_COLUMNS = [
+    "rlnImageName",
+    "rlnTomoParticleName",
+    "rlnTomoParticleId",
+    "rlnTomoName",
+    "rlnMicrographName",
+]
+AUTO_ID_CANDIDATES: tuple[tuple[str, ...], ...] = (
+    ("rlnTomoParticleName",),
+    ("rlnTomoName", "rlnTomoParticleId"),
+    ("rlnImageName",),
+    (
+        "rlnTomoName",
+        "rlnCenteredCoordinateXAngst",
+        "rlnCenteredCoordinateYAngst",
+        "rlnCenteredCoordinateZAngst",
+    ),
+    ("rlnTomoName", "rlnCoordinateX", "rlnCoordinateY", "rlnCoordinateZ"),
+    ("rlnMicrographName", "rlnCoordinateX", "rlnCoordinateY", "rlnCoordinateZ"),
+)
+
+
+@dataclass(frozen=True)
+class FrozenPoolConfig:
+    """Configuration for a frozen or carried-over particle pool."""
+
+    pool: str
+    star: Path
+    mode: str = "copy_only"
+    expected_particles: int | None = None
+    source_label: str | None = None
+
+
+@dataclass(frozen=True)
+class JobConfig:
+    """Configuration for a single RELION Class3D job."""
+
+    name: str
+    star: Path
+    k: int
+    classes: dict[str, list[int]]
+    input_pool: str | None = None
+    input_star: Path | None = None
+    model_star: Path | None = None
+    expected_particles: int | None = None
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class MergeConfig:
+    """Validated top-level configuration for class_pool_merge."""
+
+    round_label: str
+    round_prefix: str
+    project_dir: Path
+    output_dir: Path
+    pools: tuple[str, ...]
+    jobs: dict[str, JobConfig]
+    frozen: dict[str, FrozenPoolConfig] = field(default_factory=dict)
+    previous_round: str | None = None
+    previous_provenance: Path | None = None
+    id_column: str | tuple[str, ...] = "auto"
+    expected_total: int | None = None
+
+
+@dataclass(frozen=True)
+class ModelStarInfo:
+    """Parsed class model metadata from a RELION run_it*_model.star file."""
+
+    path: Path
+    k: int
+    distributions: dict[int, float]
+    empty_classes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class FrozenStarValidation:
+    """STAR metadata for a frozen pool, populated once its file is validated."""
+
+    pool_name: str
+    star: Path
+    mode: str
+    particle_count: int
+    optics_groups: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class JobStarValidation:
+    """Validated STAR metadata and particle class counts for a single Class3D job."""
+
+    job_name: str
+    data_star: Path
+    model_star: Path
+    k: int
+    particle_count: int
+    class_counts: dict[int, int]
+    pool_counts: dict[str, int]
+    empty_classes: tuple[int, ...]
+    model_empty_classes: tuple[int, ...]
+    # None means the Phase 2B-1B check has not been performed.
+    input_star_verified: bool | None = None
+    optics_groups: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True)
+class StarValidationReport:
+    """Active-job validation results and optional Phase 2B-1B results.
+
+    None denotes a check that has not been performed. The legacy total_particles
+    and pool_totals include configured frozen expectations, not measured frozen
+    counts; frozen pools without expected_particles contribute nothing to them.
+    """
+
+    jobs: dict[str, JobStarValidation]
+    active_particles: int
+    frozen_expected_particles: int
+    total_particles: int
+    pool_totals: dict[str, int]
+    frozen: dict[str, FrozenStarValidation] | None = None
+    id_columns: tuple[str, ...] | None = None
+    optics_groups: tuple[int, ...] | None = None
+    has_optics_block: bool | None = None
+    frozen_particles: int | None = None
+    unique_particle_ids: int | None = None
+    all_previous_inputs_verified: bool | None = None
+
+
+def normalize_round_label(value: Any, field_name: str = "round") -> tuple[str, str]:
+    """Normalize a round identifier into (display_label, lowercase_prefix)."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"Configuration field '{field_name}' must be a string or integer.")
+
+    if isinstance(value, int):
+        if value < 1:
+            raise ValueError(f"Configuration field '{field_name}' must be >= 1, got {value}.")
+        label = f"Round{value}"
+        return label, label.lower()
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"Configuration field '{field_name}' cannot be empty.")
+        if text.isdigit():
+            num = int(text)
+            if num < 1:
+                raise ValueError(f"Configuration field '{field_name}' must be >= 1, got {value!r}.")
+            label = f"Round{num}"
+            return label, label.lower()
+        if not SAFE_NAME_RE.fullmatch(text):
+            raise ValueError(
+                f"Configuration field '{field_name}' contains unsafe characters: {value!r}"
+            )
+        return text, text.lower()
+
+    raise ValueError(
+        f"Configuration field '{field_name}' must be a string or integer, got {type(value).__name__}."
+    )
+
+
+def parse_positive_int(value: Any, context: str, allow_zero: bool = False) -> int:
+    """Validate an integer configuration field."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{context} must be an integer, got {value!r}.")
+    minimum = 0 if allow_zero else 1
+    if value < minimum:
+        raise ValueError(f"{context} must be >= {minimum}, got {value}.")
+    return value
+
+
+def parse_class_spec(spec: Any, context: str = "class specification") -> list[int]:
+    """
+    Parse a class assignment specification into a sorted list of unique class IDs.
+
+    Supported formats:
+        - list of integers: [1, 2, 5, 8]
+        - compact range string: "1-5, 7, 9-12" or ""
+    """
+    if spec is None:
+        raise ValueError(f"{context}: class assignment cannot be None.")
+
+    numbers: list[int] = []
+
+    if isinstance(spec, list):
+        for item in spec:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ValueError(
+                    f"{context}: class list elements must be integers, got {item!r}."
+                )
+            if item < 1:
+                raise ValueError(
+                    f"{context}: class numbers must be >= 1, got {item}."
+                )
+            numbers.append(item)
+    elif isinstance(spec, str):
+        text = spec.strip()
+        if not text:
+            return []
+        tokens = [tok.strip() for tok in text.split(",")]
+        if any(tok == "" for tok in tokens):
+            raise ValueError(
+                f"{context}: malformed class range syntax (empty token) in {spec!r}."
+            )
+        for token in tokens:
+            match = RANGE_TOKEN_RE.fullmatch(token)
+            if match is None:
+                raise ValueError(
+                    f"{context}: invalid class range token {token!r} in {spec!r}."
+                )
+            start = int(match.group(1))
+            end_str = match.group(2)
+            end = int(end_str) if end_str is not None else start
+            if start < 1 or end < 1:
+                raise ValueError(
+                    f"{context}: class numbers must be >= 1 in token {token!r}."
+                )
+            if end < start:
+                raise ValueError(
+                    f"{context}: descending class range {token!r} is not allowed (start > end)."
+                )
+            numbers.extend(range(start, end + 1))
+    else:
+        raise ValueError(
+            f"{context}: expected a list of integers or range string, got {type(spec).__name__}."
+        )
+
+    seen: set[int] = set()
+    duplicates: list[int] = []
+    for num in numbers:
+        if num in seen and num not in duplicates:
+            duplicates.append(num)
+        seen.add(num)
+
+    if duplicates:
+        raise ValueError(
+            f"{context}: duplicate class numbers in specification: {sorted(duplicates)}"
+        )
+
+    return numbers
+
+
+def resolve_config_path(raw_path: Any, base_dir: Path, context: str) -> Path:
+    """Validate a non-empty path string and resolve relative to base_dir."""
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError(f"{context} must be a non-empty path string.")
+    path = Path(raw_path.strip()).expanduser()
+    return path if path.is_absolute() else (base_dir / path)
+
+
+def parse_pools(raw_pools: Any) -> tuple[str, ...]:
+    """Validate ordered list of unique output pool names."""
+    if not isinstance(raw_pools, list) or not raw_pools:
+        raise ValueError("Configuration field 'pools' must be a non-empty list of pool names.")
+
+    pools: list[str] = []
+    seen: set[str] = set()
+    duplicates: list[str] = []
+
+    for item in raw_pools:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("Every pool name in 'pools' must be a non-empty string.")
+        name = item.strip()
+        if not SAFE_NAME_RE.fullmatch(name):
+            raise ValueError(f"Pool name {name!r} contains invalid characters.")
+        if name in seen:
+            if name not in duplicates:
+                duplicates.append(name)
+        seen.add(name)
+        pools.append(name)
+
+    if duplicates:
+        raise ValueError(f"Duplicate pool names in 'pools': {duplicates}")
+
+    return tuple(pools)
+
+
+def parse_frozen_pools(
+    raw_frozen: Any,
+    pools: tuple[str, ...],
+    project_dir: Path,
+    prev_round_label: str | None,
+) -> dict[str, FrozenPoolConfig]:
+    """Validate optional [frozen.<Pool>] sections."""
+    if raw_frozen is None:
+        return {}
+    if not isinstance(raw_frozen, dict):
+        raise ValueError("Configuration section 'frozen' must be a table.")
+
+    valid_pools = set(pools)
+    frozen_configs: dict[str, FrozenPoolConfig] = {}
+
+    for pool_name, entry in raw_frozen.items():
+        if pool_name not in valid_pools:
+            raise ValueError(
+                f"Frozen pool {pool_name!r} is not declared in 'pools' ({list(pools)})."
+            )
+        if not isinstance(entry, dict):
+            raise ValueError(f"frozen.{pool_name} must be a table.")
+
+        if "star" not in entry:
+            raise ValueError(f"frozen.{pool_name} is missing required field 'star'.")
+        star_path = resolve_config_path(
+            entry["star"], project_dir, f"frozen.{pool_name}.star"
+        )
+
+        mode = entry.get("mode", "copy_only")
+        if not isinstance(mode, str) or mode not in VALID_FROZEN_MODES:
+            raise ValueError(
+                f"frozen.{pool_name}.mode must be one of {list(VALID_FROZEN_MODES)}, got {mode!r}."
+            )
+
+        expected_raw = entry.get("expected_particles", entry.get("expected"))
+        expected_particles = (
+            parse_positive_int(expected_raw, f"frozen.{pool_name}.expected_particles")
+            if expected_raw is not None
+            else None
+        )
+
+        default_label = (
+            f"FROZEN_{prev_round_label.upper()}" if prev_round_label else f"FROZEN_{pool_name.upper()}"
+        )
+        source_label = entry.get("source_label", default_label)
+        if not isinstance(source_label, str) or not source_label.strip():
+            raise ValueError(f"frozen.{pool_name}.source_label must be a non-empty string.")
+
+        frozen_configs[pool_name] = FrozenPoolConfig(
+            pool=pool_name,
+            star=star_path,
+            mode=mode,
+            expected_particles=expected_particles,
+            source_label=source_label.strip(),
+        )
+
+    return frozen_configs
+
+
+def parse_jobs(
+    raw_jobs: Any,
+    pools: tuple[str, ...],
+    frozen: dict[str, FrozenPoolConfig],
+    project_dir: Path,
+) -> dict[str, JobConfig]:
+    """Validate [jobs.<JobName>] sections and enforce strict 1..K class partitioning."""
+    if not isinstance(raw_jobs, dict) or not raw_jobs:
+        raise ValueError("Configuration must define a non-empty 'jobs' table.")
+
+    valid_pools = set(pools)
+    jobs: dict[str, JobConfig] = {}
+
+    for job_name, entry in raw_jobs.items():
+        if not isinstance(job_name, str) or not job_name.strip():
+            raise ValueError("Job names in 'jobs' must be non-empty strings.")
+        if not isinstance(entry, dict):
+            raise ValueError(f"jobs.{job_name} must be a table.")
+
+        if "star" not in entry:
+            raise ValueError(f"jobs.{job_name} is missing required field 'star'.")
+        star_path = resolve_config_path(
+            entry["star"], project_dir, f"jobs.{job_name}.star"
+        )
+
+        if "k" not in entry:
+            raise ValueError(f"jobs.{job_name} is missing required field 'k' (number of classes).")
+        k = parse_positive_int(entry["k"], f"jobs.{job_name}.k")
+
+        expected_raw = entry.get("expected_particles", entry.get("expected"))
+        expected_particles = (
+            parse_positive_int(expected_raw, f"jobs.{job_name}.expected_particles")
+            if expected_raw is not None
+            else None
+        )
+
+        input_pool = entry.get("input_pool")
+        if input_pool is not None:
+            if not isinstance(input_pool, str) or not input_pool.strip():
+                raise ValueError(f"jobs.{job_name}.input_pool must be a non-empty string.")
+            input_pool = input_pool.strip()
+
+        input_star = (
+            resolve_config_path(entry["input_star"], project_dir, f"jobs.{job_name}.input_star")
+            if "input_star" in entry and entry["input_star"] is not None
+            else None
+        )
+
+        model_star = (
+            resolve_config_path(entry["model_star"], project_dir, f"jobs.{job_name}.model_star")
+            if "model_star" in entry and entry["model_star"] is not None
+            else None
+        )
+
+        note = entry.get("note")
+        if note is not None and not isinstance(note, str):
+            raise ValueError(f"jobs.{job_name}.note must be a string.")
+
+        raw_classes = entry.get("classes")
+        if not isinstance(raw_classes, dict) or not raw_classes:
+            raise ValueError(
+                f"jobs.{job_name} must define a non-empty 'classes' table mapping pools to classes."
+            )
+
+        unknown_pools = [p for p in raw_classes if p not in valid_pools]
+        if unknown_pools:
+            raise ValueError(
+                f"jobs.{job_name}.classes references unknown target pool(s) {unknown_pools}; "
+                f"valid pools are {list(pools)}."
+            )
+
+        parsed_classes: dict[str, list[int]] = {}
+        for pool_name in pools:
+            if pool_name in raw_classes:
+                class_list = parse_class_spec(
+                    raw_classes[pool_name],
+                    context=f"jobs.{job_name}.classes.{pool_name}",
+                )
+            else:
+                class_list = []
+
+            if class_list and pool_name in frozen and frozen[pool_name].mode == "copy_only":
+                raise ValueError(
+                    f"jobs.{job_name}.classes.{pool_name}: pool {pool_name!r} is configured as "
+                    f"frozen with mode='copy_only' and cannot accept new class assignments "
+                    f"({class_list}). Set mode='append' explicitly if additions are intended."
+                )
+
+            parsed_classes[pool_name] = class_list
+
+        # Validate complete, mutually exclusive partitioning of 1..K.
+        assigned_all: list[int] = []
+        class_to_pools: dict[int, list[str]] = {}
+        for pool_name, class_list in parsed_classes.items():
+            for cls_id in class_list:
+                assigned_all.append(cls_id)
+                class_to_pools.setdefault(cls_id, []).append(pool_name)
+
+        out_of_range = sorted(c for c in set(assigned_all) if c < 1 or c > k)
+        if out_of_range:
+            raise ValueError(
+                f"jobs.{job_name}: class numbers out of range 1..{k}: {out_of_range}"
+            )
+
+        duplicate_classes = {
+            c: pool_list for c, pool_list in class_to_pools.items() if len(pool_list) > 1
+        }
+        if duplicate_classes:
+            details = ", ".join(
+                f"class {c} in {pool_list}" for c, pool_list in sorted(duplicate_classes.items())
+            )
+            raise ValueError(
+                f"jobs.{job_name}: duplicate class assignments across pools ({details})."
+            )
+
+        expected_set = set(range(1, k + 1))
+        assigned_set = set(assigned_all)
+        missing_classes = sorted(expected_set - assigned_set)
+        if missing_classes:
+            raise ValueError(
+                f"jobs.{job_name}: missing class assignments for K={k}: {missing_classes}. "
+                f"Every class from 1 to {k} must be assigned to exactly one pool."
+            )
+
+        jobs[job_name] = JobConfig(
+            name=job_name,
+            star=star_path,
+            k=k,
+            classes=parsed_classes,
+            input_pool=input_pool,
+            input_star=input_star,
+            model_star=model_star,
+            expected_particles=expected_particles,
+            note=note,
+        )
+
+    return jobs
+
+
+def parse_id_column(raw_id_col: Any) -> str | tuple[str, ...]:
+    """Validate optional id_column specification."""
+    if raw_id_col is None:
+        return "auto"
+    if isinstance(raw_id_col, str):
+        text = raw_id_col.strip()
+        if not text:
+            raise ValueError("Configuration field 'id_column' cannot be empty.")
+        return text
+    if isinstance(raw_id_col, list) and raw_id_col:
+        cols: list[str] = []
+        for item in raw_id_col:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("Elements of 'id_column' must be non-empty strings.")
+            cols.append(item.strip())
+        if len(set(cols)) != len(cols):
+            raise ValueError(f"Duplicate column names in 'id_column': {cols}")
+        return tuple(cols)
+    raise ValueError("Configuration field 'id_column' must be a string or non-empty list of strings.")
+
+
+def load_config(
+    config_path: Path,
+    project_dir_override: Path | None = None,
+    outdir_override: Path | None = None,
+) -> MergeConfig:
+    """Read and validate a TOML configuration file for class_pool_merge."""
+    if not config_path.exists():
+        raise FileNotFoundError(f"Configuration file does not exist: {config_path}")
+    if not config_path.is_file():
+        raise ValueError(f"Configuration path is not a file: {config_path}")
+
+    raw_bytes = config_path.read_bytes()
+    try:
+        data = tomllib.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError(f"Failed to parse TOML configuration {config_path}: {exc}") from exc
+
+    if "round" not in data:
+        raise ValueError("Configuration is missing required field 'round'.")
+    round_label, round_prefix = normalize_round_label(data["round"], "round")
+
+    previous_round: str | None = None
+    if "previous_round" in data and data["previous_round"] is not None:
+        previous_round, _ = normalize_round_label(data["previous_round"], "previous_round")
+
+    if project_dir_override is not None:
+        project_dir = project_dir_override.expanduser().resolve()
+    elif "project_dir" in data and data["project_dir"] is not None:
+        if not isinstance(data["project_dir"], str) or not data["project_dir"].strip():
+            raise ValueError("Configuration field 'project_dir' must be a non-empty path string.")
+        project_dir = Path(data["project_dir"].strip()).expanduser().resolve()
+    else:
+        project_dir = Path(".").resolve()
+
+    if outdir_override is not None:
+        raw_out = outdir_override.expanduser()
+        output_dir = raw_out if raw_out.is_absolute() else (project_dir / raw_out)
+    elif "output_dir" in data and data["output_dir"] is not None:
+        output_dir = resolve_config_path(data["output_dir"], project_dir, "output_dir")
+    else:
+        output_dir = project_dir / f"{round_label}_split"
+
+    if "pools" not in data:
+        raise ValueError("Configuration is missing required field 'pools'.")
+    pools = parse_pools(data["pools"])
+
+    frozen = parse_frozen_pools(
+        data.get("frozen"),
+        pools=pools,
+        project_dir=project_dir,
+        prev_round_label=previous_round,
+    )
+
+    if "jobs" not in data:
+        raise ValueError("Configuration is missing required section 'jobs'.")
+    jobs = parse_jobs(
+        data["jobs"],
+        pools=pools,
+        frozen=frozen,
+        project_dir=project_dir,
+    )
+
+    expected_total: int | None = None
+    if "expected_total" in data and data["expected_total"] is not None:
+        expected_total = parse_positive_int(data["expected_total"], "expected_total")
+
+    # If expected_total and all source expected_particles are specified, verify their sum matches.
+    all_sources_have_expected = all(
+        f.expected_particles is not None for f in frozen.values()
+    ) and all(j.expected_particles is not None for j in jobs.values())
+
+    if expected_total is not None and all_sources_have_expected:
+        source_sum = sum(f.expected_particles or 0 for f in frozen.values()) + sum(
+            j.expected_particles or 0 for j in jobs.values()
+        )
+        if source_sum != expected_total:
+            raise ValueError(
+                f"Sum of expected_particles across frozen pools and jobs ({source_sum:,}) "
+                f"does not match expected_total ({expected_total:,})."
+            )
+
+    previous_provenance = (
+        resolve_config_path(data["previous_provenance"], project_dir, "previous_provenance")
+        if "previous_provenance" in data and data["previous_provenance"] is not None
+        else None
+    )
+
+    id_column = parse_id_column(data.get("id_column"))
+
+    return MergeConfig(
+        round_label=round_label,
+        round_prefix=round_prefix,
+        project_dir=project_dir,
+        output_dir=output_dir,
+        pools=pools,
+        jobs=jobs,
+        frozen=frozen,
+        previous_round=previous_round,
+        previous_provenance=previous_provenance,
+        id_column=id_column,
+        expected_total=expected_total,
+    )
+
+
+def derive_model_star_path(jcfg: JobConfig) -> Path:
+    """Resolve the model STAR path for a Class3D job configuration."""
+    if jcfg.model_star is not None:
+        return jcfg.model_star
+    name = jcfg.star.name
+    if name.endswith("_data.star"):
+        return jcfg.star.with_name(name[:-len("_data.star")] + "_model.star")
+    raise ValueError(
+        f"jobs.{jcfg.name}: cannot derive model STAR path from {jcfg.star.name!r}; "
+        f"expected '*_data.star' or explicit 'model_star' in configuration."
+    )
+
+
+def parse_model_star(model_path: Path) -> ModelStarInfo:
+    """
+    Read a RELION Class3D run_it*_model.star file to extract K, class indices,
+    and _rlnClassDistribution (including zero-particle classes).
+    """
+    if not model_path.exists():
+        raise FileNotFoundError(f"Missing RELION model STAR file: {model_path}")
+    if not model_path.is_file():
+        raise ValueError(f"Expected a model STAR file but found directory: {model_path}")
+
+    lines = model_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    nr_classes_general: int | None = None
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if stripped.startswith("_rlnNrClasses"):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                try:
+                    nr_classes_general = int(parts[1])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{model_path}: invalid _rlnNrClasses value {parts[1]!r}."
+                    ) from exc
+            break
+
+    index = 0
+    class_rows: list[dict[str, str]] = []
+    while index < len(lines):
+        if lines[index].strip() != "loop_":
+            index += 1
+            continue
+
+        index += 1
+        headers: list[str] = []
+        while index < len(lines):
+            line = lines[index].strip()
+            if not line or line.startswith("#"):
+                index += 1
+                continue
+            if line.startswith("_"):
+                headers.append(line.split()[0])
+                index += 1
+                continue
+            break
+
+        required_headers = {"_rlnReferenceImage", "_rlnClassDistribution"}
+        if not required_headers.issubset(headers):
+            continue
+
+        rows: list[dict[str, str]] = []
+        while index < len(lines):
+            line = lines[index].strip()
+            if not line:
+                if rows:
+                    break
+                index += 1
+                continue
+            if line.startswith("#"):
+                index += 1
+                continue
+            if line == "loop_" or line.startswith("data_") or line.startswith("_"):
+                break
+            try:
+                values = shlex.split(line)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{model_path}: malformed row in data_model_classes loop: {line!r}"
+                ) from exc
+            if len(values) < len(headers):
+                raise ValueError(
+                    f"{model_path}: incomplete row in data_model_classes loop: {line!r}"
+                )
+            rows.append(dict(zip(headers, values[: len(headers)])))
+            index += 1
+
+        if rows:
+            class_rows = rows
+            break
+
+    if not class_rows:
+        raise ValueError(
+            f"{model_path}: could not find class model loop with "
+            f"_rlnReferenceImage and _rlnClassDistribution."
+        )
+
+    distributions: dict[int, float] = {}
+    for row in class_rows:
+        ref_image = row["_rlnReferenceImage"]
+        match = MODEL_CLASS_RE.search(ref_image)
+        if match is None:
+            raise ValueError(
+                f"{model_path}: could not parse class number from "
+                f"_rlnReferenceImage {ref_image!r}."
+            )
+        class_num = int(match.group(1))
+        if class_num < 1:
+            raise ValueError(
+                f"{model_path}: invalid class number {class_num} in {ref_image!r}."
+            )
+        if class_num in distributions:
+            raise ValueError(
+                f"{model_path}: duplicate class number {class_num} in model loop."
+            )
+
+        raw_dist = row["_rlnClassDistribution"]
+        try:
+            dist = float(raw_dist)
+        except ValueError as exc:
+            raise ValueError(
+                f"{model_path}: invalid _rlnClassDistribution {raw_dist!r} "
+                f"for class {class_num}."
+            ) from exc
+        if math.isnan(dist) or math.isinf(dist) or dist < 0.0:
+            raise ValueError(
+                f"{model_path}: invalid _rlnClassDistribution {dist} for class {class_num}."
+            )
+        distributions[class_num] = dist
+
+    k_model = len(distributions)
+    expected_classes = set(range(1, k_model + 1))
+    if set(distributions.keys()) != expected_classes:
+        raise ValueError(
+            f"{model_path}: model classes {sorted(distributions.keys())} do not form "
+            f"a contiguous 1..{k_model} range."
+        )
+
+    if nr_classes_general is not None and nr_classes_general != k_model:
+        raise ValueError(
+            f"{model_path}: _rlnNrClasses ({nr_classes_general}) disagrees with "
+            f"number of class entries ({k_model}) in data_model_classes."
+        )
+
+    empty_classes = tuple(sorted(c for c, d in distributions.items() if d == 0.0))
+    return ModelStarInfo(
+        path=model_path,
+        k=k_model,
+        distributions=distributions,
+        empty_classes=empty_classes,
+    )
+
+
+def read_data_star(star_path: Path) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Read a RELION data STAR file and validate its particles table."""
+    if not star_path.exists():
+        raise FileNotFoundError(f"Missing RELION data STAR file: {star_path}")
+    if not star_path.is_file():
+        raise ValueError(f"Expected a STAR file but found directory: {star_path}")
+
+    try:
+        blocks = starfile.read(
+            star_path,
+            always_dict=True,
+            parse_as_string=STRING_ID_COLUMNS,
+        )
+    except Exception as exc:
+        raise ValueError(f"Failed to parse STAR file {star_path}: {exc}") from exc
+
+    if not isinstance(blocks, dict) or "particles" not in blocks:
+        raise ValueError(f"{star_path}: missing 'particles' (data_particles) block.")
+
+    particles = blocks["particles"]
+    if not isinstance(particles, pd.DataFrame):
+        raise ValueError(f"{star_path}: 'particles' block is not a valid table.")
+    if len(particles) == 0:
+        raise ValueError(f"{star_path}: 'particles' table is empty (0 rows).")
+    if "rlnClassNumber" not in particles.columns:
+        raise ValueError(f"{star_path}: missing required column 'rlnClassNumber'.")
+
+    return blocks, particles
+
+
+def validate_job_star(jcfg: JobConfig, pools: tuple[str, ...]) -> JobStarValidation:
+    """Validate a single Class3D job's data STAR and model STAR files."""
+    model_path = derive_model_star_path(jcfg)
+    model_info = parse_model_star(model_path)
+
+    if model_info.k != jcfg.k:
+        raise ValueError(
+            f"{jcfg.name}: configured k={jcfg.k} does not match model STAR K={model_info.k} "
+            f"in {model_path}."
+        )
+
+    _, particles = read_data_star(jcfg.star)
+    particle_count = len(particles)
+
+    if jcfg.expected_particles is not None and particle_count != jcfg.expected_particles:
+        raise ValueError(
+            f"{jcfg.name}: expected {jcfg.expected_particles:,} particles, "
+            f"found {particle_count:,} in {jcfg.star}."
+        )
+
+    raw_classes = particles["rlnClassNumber"]
+    if raw_classes.isna().any():
+        raise ValueError(f"{jcfg.name}: null/NaN values found in rlnClassNumber ({jcfg.star}).")
+
+    try:
+        numeric_classes = pd.to_numeric(raw_classes, errors="raise")
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"{jcfg.name}: non-numeric values found in rlnClassNumber ({jcfg.star})."
+        ) from exc
+
+    if not (numeric_classes == numeric_classes.astype(int)).all():
+        raise ValueError(
+            f"{jcfg.name}: non-integer class numbers found in rlnClassNumber ({jcfg.star})."
+        )
+
+    classes = numeric_classes.astype(int)
+    valid_range = set(range(1, jcfg.k + 1))
+    observed_classes = set(classes.unique())
+    out_of_range = sorted(observed_classes - valid_range)
+    if out_of_range:
+        raise ValueError(
+            f"{jcfg.name}: data STAR {jcfg.star} contains rlnClassNumber values "
+            f"outside 1..{jcfg.k}: {out_of_range}."
+        )
+
+    class_counts = {cls_id: int((classes == cls_id).sum()) for cls_id in range(1, jcfg.k + 1)}
+    empty_classes = tuple(sorted(cls_id for cls_id, cnt in class_counts.items() if cnt == 0))
+
+    # Verify model vs data consistency: a class with 0.0 distribution in model.star
+    # must not contain particles in data.star, and vice versa.
+    inconsistent_nonempty = [
+        cls_id for cls_id in model_info.empty_classes if class_counts[cls_id] > 0
+    ]
+    if inconsistent_nonempty:
+        raise ValueError(
+            f"{jcfg.name}: class(es) {inconsistent_nonempty} have 0.0 distribution in "
+            f"{model_path.name} but contain particles in {jcfg.star.name}."
+        )
+
+    inconsistent_empty = [
+        cls_id
+        for cls_id in empty_classes
+        if cls_id not in model_info.empty_classes and model_info.distributions[cls_id] > 0.0
+    ]
+    if inconsistent_empty:
+        raise ValueError(
+            f"{jcfg.name}: class(es) {inconsistent_empty} have 0 particles in "
+            f"{jcfg.star.name} but non-zero distribution in {model_path.name}."
+        )
+
+    pool_counts: dict[str, int] = {}
+    assigned_particle_sum = 0
+    for pool_name in pools:
+        assigned_cls = jcfg.classes.get(pool_name, [])
+        count = sum(class_counts[c] for c in assigned_cls)
+        pool_counts[pool_name] = count
+        assigned_particle_sum += count
+
+    if assigned_particle_sum != particle_count:
+        raise ValueError(
+            f"{jcfg.name}: assigned pool particle sum ({assigned_particle_sum:,}) "
+            f"does not match job particle count ({particle_count:,})."
+        )
+
+    return JobStarValidation(
+        job_name=jcfg.name,
+        data_star=jcfg.star,
+        model_star=model_path,
+        k=jcfg.k,
+        particle_count=particle_count,
+        class_counts=class_counts,
+        pool_counts=pool_counts,
+        empty_classes=empty_classes,
+        model_empty_classes=model_info.empty_classes,
+    )
+
+
+def validate_star_inputs(cfg: MergeConfig) -> StarValidationReport:
+    """Validate active job classes/models/counts; other checks remain unverified."""
+    job_reports: dict[str, JobStarValidation] = {}
+    pool_totals: dict[str, int] = {pool: 0 for pool in cfg.pools}
+    active_particles = 0
+
+    for job_name, jcfg in cfg.jobs.items():
+        jval = validate_job_star(jcfg, cfg.pools)
+        job_reports[job_name] = jval
+        active_particles += jval.particle_count
+        for pool_name, count in jval.pool_counts.items():
+            pool_totals[pool_name] += count
+
+    frozen_expected = sum(f.expected_particles or 0 for f in cfg.frozen.values())
+    for pool_name, fcfg in cfg.frozen.items():
+        if fcfg.expected_particles is not None:
+            pool_totals[pool_name] += fcfg.expected_particles
+
+    total_particles = active_particles + frozen_expected
+    if cfg.expected_total is not None:
+        if not cfg.frozen or all(f.expected_particles is not None for f in cfg.frozen.values()):
+            if total_particles != cfg.expected_total:
+                raise ValueError(
+                    f"Total validated particles ({total_particles:,}) does not match "
+                    f"configured expected_total ({cfg.expected_total:,})."
+                )
+
+    return StarValidationReport(
+        jobs=job_reports,
+        active_particles=active_particles,
+        frozen_expected_particles=frozen_expected,
+        total_particles=total_particles,
+        pool_totals=pool_totals,
+        # Absence of frozen inputs is known from the config. Configured frozen
+        # files have not been read, so their measured results remain unknown.
+        frozen=None if cfg.frozen else {},
+        frozen_particles=None if cfg.frozen else 0,
+    )
+
+
+def format_validation_summary(
+    cfg: MergeConfig,
+    star_report: StarValidationReport | None = None,
+) -> str:
+    """Format a human-readable summary of the validated configuration and STAR inputs."""
+    lines = [
+        "=" * 72,
+        f"RELION Class3D Pool Merge Validation — {cfg.round_label}",
+        "=" * 72,
+        f"Project directory : {cfg.project_dir}",
+        f"Output directory  : {cfg.output_dir}",
+        f"Output pools ({len(cfg.pools)}) : {', '.join(cfg.pools)}",
+        f"Identity column   : {cfg.id_column if isinstance(cfg.id_column, str) else ', '.join(cfg.id_column)}",
+    ]
+    if cfg.expected_total is not None:
+        lines.append(f"Expected total    : {cfg.expected_total:,} particles")
+
+    if cfg.frozen:
+        lines.append("")
+        lines.append(f"Frozen pools ({len(cfg.frozen)}):")
+        for pool_name, fcfg in cfg.frozen.items():
+            exp = f", expected={fcfg.expected_particles:,}" if fcfg.expected_particles is not None else ""
+            lines.append(f"  - {pool_name}: mode={fcfg.mode}{exp} ({fcfg.star})")
+
+    lines.append("")
+    lines.append(f"Active Class3D jobs ({len(cfg.jobs)}):")
+    for job_name, jcfg in cfg.jobs.items():
+        in_pool = f", input_pool={jcfg.input_pool}" if jcfg.input_pool else ""
+        if star_report is not None and job_name in star_report.jobs:
+            jval = star_report.jobs[job_name]
+            lines.append(
+                f"  - {job_name}: K={jval.k} (model verified){in_pool}, "
+                f"particles={jval.particle_count:,} ({jcfg.star.name})"
+            )
+            empty_str = (
+                ", ".join(map(str, jval.empty_classes)) if jval.empty_classes else "none"
+            )
+            lines.append(f"      Zero-particle classes : {empty_str}")
+            for pool_name in cfg.pools:
+                assigned = jcfg.classes.get(pool_name, [])
+                if assigned or jval.pool_counts.get(pool_name, 0) > 0:
+                    pcount = jval.pool_counts[pool_name]
+                    lines.append(
+                        f"      -> {pool_name:12s}: {pcount:>8,d} particles "
+                        f"({len(assigned):2d} classes: {assigned})"
+                    )
+        else:
+            exp = f", expected={jcfg.expected_particles:,}" if jcfg.expected_particles is not None else ""
+            lines.append(f"  - {job_name}: K={jcfg.k}{in_pool}{exp} ({jcfg.star})")
+            for pool_name in cfg.pools:
+                assigned = jcfg.classes.get(pool_name, [])
+                if assigned:
+                    lines.append(f"      -> {pool_name:12s}: {len(assigned):2d} classes {assigned}")
+
+    if star_report is not None:
+        lines.append("")
+        if cfg.frozen and star_report.frozen_particles is None:
+            lines.append("Pool totals (active counts + configured frozen expectations):")
+            lines.append("  Frozen STAR files have not been validated.")
+            if any(f.expected_particles is None for f in cfg.frozen.values()):
+                lines.append("  Frozen pools without expected_particles are excluded from totals.")
+        else:
+            lines.append("Validated pool totals:")
+        for pool_name in cfg.pools:
+            count = star_report.pool_totals[pool_name]
+            pct = (100.0 * count / star_report.total_particles) if star_report.total_particles else 0.0
+            lines.append(f"  {pool_name:14s}: {count:>8,d} ({pct:6.2f}%)")
+        lines.append(f"  {'TOTAL':14s}: {star_report.total_particles:>8,d}")
+
+        pending_checks = []
+        if star_report.id_columns is None or star_report.unique_particle_ids is None:
+            pending_checks.append("particle identity/uniqueness")
+        if star_report.optics_groups is None or star_report.has_optics_block is None:
+            pending_checks.append("optics compatibility")
+        if star_report.all_previous_inputs_verified is None:
+            pending_checks.append("previous inputs")
+        if pending_checks:
+            lines.append("")
+            lines.append(f"Checks not yet performed: {', '.join(pending_checks)}.")
+
+    lines.append("=" * 72)
+    return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="class_pool_merge",
+        description=(
+            "Validate and merge RELION Class3D particle pools across multiple "
+            "jobs using a declarative TOML configuration."
+        ),
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=Path,
+        required=True,
+        metavar="CONFIG.toml",
+        help="Path to the TOML configuration file.",
+    )
+    parser.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Override the RELION project root directory.",
+    )
+    parser.add_argument(
+        "-o",
+        "--outdir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Override the output directory.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate configuration and inputs without writing output files.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        cfg = load_config(
+            config_path=args.config,
+            project_dir_override=args.project_dir,
+            outdir_override=args.outdir,
+        )
+        star_report = validate_star_inputs(cfg)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(format_validation_summary(cfg, star_report))
+    if args.dry_run:
+        print("Configuration and STAR input validation succeeded (--dry-run).")
+        return 0
+
+    print(
+        "ERROR: Particle merging and STAR output writing are not yet implemented "
+        "(use --dry-run to validate configuration and STAR inputs).",
+        file=sys.stderr,
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
