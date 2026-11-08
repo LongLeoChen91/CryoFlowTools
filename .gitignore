@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
 *.pyo
-/tests/
+/tests/*
+!/tests/test_class_pool_merge.py
