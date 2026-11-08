@@ -12,6 +12,7 @@ workflows on HPC clusters.
 | `missali_report` | `missalignment/` | Summarises MissAlignment `*_alignment_loss.json` results |
 | `class_distribution` | `relion/` | Tracks RELION Class3D class distributions across iterations |
 | `compare_class3d_jobs` | `relion/` | Compares particle class assignments between two RELION Class3D `*_data.star` files |
+| `class_pool_merge` | `relion/` | Validates and merges manually assigned Class3D pools with frozen-pool preservation and particle lineage |
 | `split_star_by_tomo` | `relion/` | Splits a RELION STAR file into one file per `rlnTomoName` or `rlnMicrographName` |
 | `merge_star_files` | `relion/` | Merges compatible RELION STAR files while preserving particle metadata and other blocks |
 | `m_progressive` | `m/` | Prepares RELION-to-M inputs and generates a progressive refinement shell script |
@@ -28,7 +29,7 @@ pip install -r requirements.txt
 The scripts are standalone executables. Make them executable if needed:
 
 ```bash
-chmod +x hpc/gpuview hpc/jobdiag relion/class_distribution relion/compare_class3d_jobs relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
+chmod +x hpc/gpuview hpc/jobdiag relion/class_distribution relion/compare_class3d_jobs relion/class_pool_merge relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
 ```
 
 `m_resolution` and `m_progressive` use only the Python standard library.
@@ -83,6 +84,129 @@ relion/compare_class3d_jobs \
     Class3D/job020/run_it025_data.star \
     Class3D/job025/run_it022_data.star
 ```
+
+### class_pool_merge
+
+Route manually selected RELION Class3D classes into configurable particle pools
+across multiple jobs, retaining frozen pools and cumulative particle lineage.
+Requires Python 3.11+, `pandas`, and `starfile` from the existing requirements.
+The tool validates the researcher's assignments; it does not interpret class morphology.
+
+Save a TOML configuration such as `round2.toml`, using your actual project paths:
+
+```toml
+round = 2
+previous_round = 1
+project_dir = "/path/to/relion/project"
+output_dir = "Round2_split"
+pools = ["Good", "Junk"]
+id_column = "rlnImageName"
+
+[jobs.job002]
+star = "Class3D/job002/run_it025_data.star"
+input_star = "previous_input.star"
+input_pool = "Mix"
+k = 2
+
+[jobs.job002.classes]
+Good = [1]
+Junk = [2]
+```
+
+Add `[jobs.<name>]` sections for additional jobs. Every class in `1..k`, including
+zero-particle classes, must belong to exactly one pool. Assignments accept integer
+lists or strings such as `"1-3, 7"`; `[]` and `""` assign no classes.
+The model path is derived from `*_data.star`, or supplied as `model_star`.
+Optional `expected_particles` on jobs/frozen pools and top-level `expected_total`
+are checked against measured counts. Paths resolve against `project_dir`, which
+defaults to the current directory; `--project-dir` and `--outdir` override it and
+the destination respectively.
+
+```bash
+python relion/class_pool_merge --config round2.toml --dry-run
+python relion/class_pool_merge --config round2.toml
+```
+
+Dry-run is read-only, including when the destination already exists. Normal
+execution requires each job's `input_star` to match its complete output identity
+set, regardless of row order. If evidence is unavailable, execution refuses by
+default; `--allow-unverified-inputs` explicitly permits those missing checks and
+records the incomplete verification in reports. It never bypasses a failed check
+on a configured input. No existing result directory is overwritten.
+
+To carry a pool forward, declare its name in `pools` and add, for example:
+
+```toml
+[frozen.Archive]
+star = "Round1_split/particles_Round1_Archive_250.star"
+mode = "copy_only"
+expected_particles = 250
+```
+
+`copy_only` preserves that STAR byte-for-byte and forbids new class assignments
+to the pool. Explicit `mode = "append"` allows new assignments: existing frozen
+rows come first, followed by selected rows in configured job order, preserving
+each source's row order. Multiple frozen pools are supported. Their identities
+must be unique and disjoint from every other active or frozen source.
+
+Outputs include `particles_<round>_<pool>_<count>.star` for every pool, including
+header-only STAR tables for empty pools, plus `manifest.json`, `summary.txt`,
+the effective `config.toml`, `provenance.json`, and `provenance.csv`. The manifest
+records input paths, assignments, counts, software versions, parameters, and
+verification results. JSON provenance uses schema version 1 with identity tuples
+and per-particle history events; CSV provides cumulative flat lineage fields.
+
+Set top-level `previous_provenance` to a prior JSON provenance file or historical
+CSV, and supply `previous_round`. Historical CSV must contain the selected identity
+columns and `<previous_round_prefix>_pool` (for example, `round1_pool`). Every
+particle must be covered exactly once, with pool labels consistent with the input
+sources. All previous fields are retained and the original provenance file is
+archived alongside the reports. Unsupported formats and conflicting lineage fail
+explicitly; absent previous provenance is recorded as unavailable.
+
+Before publication, the tool checks optics-group references, compatible optics
+definitions and other STAR blocks, output particle schemas, and exact identity-set
+conservation. Compatible optics groups may be combined without renumbering; other
+metadata comparisons allow harmless row ordering and tight floating-point
+serialization differences. Mixed optics/no-optics inputs are rejected. Inputs
+without optics are supported when none references an optics group. Files are
+written to a sibling staging directory, read back to verify their identities,
+counts and metadata, then published atomically without replacing an existing
+destination. Where the filesystem supports it, publication uses a no-replace
+directory rename. On BMRC GPFS, the final path is an atomically created directory
+symlink to a hidden sibling `.<output>.data-<suffix>` containing the complete
+result. The CLI reports this fallback explicitly. Atomic publication means that
+readers see either no result or the complete result; it does not guarantee
+persistence after power loss or a filesystem crash.
+
+For GPFS results, keep the relative link and its hidden backing directory together
+in the same parent when moving them. To make an independent copy, copy the contents
+through the link into a new destination, for example
+`cp -aL Round2_split/. /path/to/new-copy/`. To archive only the result, archive its
+contents by changing into it, for example
+`tar -czf /path/to/round2.tar.gz -C Round2_split .`; archiving the symlink alone
+does not include its data. Check the copied or archived contents before removing
+the source. To delete a result, first record and verify the target with
+`readlink Round2_split`, remove the link without a trailing slash, then remove
+only that verified backing directory when no longer needed. Deleting only the
+link leaves the data; deleting only the backing directory leaves a broken link.
+
+Caught failures clean up unpublished storage. Abrupt termination (such as SIGKILL)
+or node failure can leave an unpublished hidden directory. Inspect such directories
+before cleanup, and never delete storage referenced by a result link. Processing
+is in memory; plan RAM for the source tables, selected rows, and provenance.
+
+Choose an explicit identity known to be stable in your workflow, such as
+`rlnImageName` for an appropriate subtomogram workflow, or a composite list such
+as `["rlnTomoName", "rlnTomoParticleId"]`. `id_column = "auto"` requires exactly
+one common named candidate across all inputs; it does not establish stability
+outside those files. IDs retain exact string spelling, including leading zeros;
+paths and coordinates are not normalized. Coordinate identities require explicit
+selection. Embedded quotes, unquoted hashes, and multiline particle tokens that
+the installed parser cannot preserve safely are rejected. Repeated block names in
+particle STAR files are rejected before parsing can discard particles or metadata.
+Particle column sets must agree within each merged pool; no columns are silently
+dropped.
 
 ### split_star_by_tomo
 

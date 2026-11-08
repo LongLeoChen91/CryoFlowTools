@@ -11,18 +11,36 @@ Phase 2A foundation:
     - Compact class range and integer list parsing
     - Strict validation of pools, frozen-pool modes, and 1..K class partitions
 
+Phase 2B validation:
+    - Class/model consistency and measured particle counts
+    - Explicit or unambiguous common particle identities, including composites
+    - Previous-input identity conservation and disjoint active/frozen sources
+    - Optics/metadata compatibility, cumulative provenance and atomic pool output
+
 Developed and maintained by Long Chen.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+import csv
+import ctypes
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+import errno
+import hashlib
+from heapq import nsmallest
+import importlib.metadata
+import json
 import math
+from numbers import Integral
+import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import sys
+import tempfile
 import tomllib
 from typing import Any
 
@@ -40,20 +58,18 @@ STRING_ID_COLUMNS = [
     "rlnTomoParticleId",
     "rlnTomoName",
     "rlnMicrographName",
+    "rlnOpticsGroupName",
 ]
 AUTO_ID_CANDIDATES: tuple[tuple[str, ...], ...] = (
     ("rlnTomoParticleName",),
     ("rlnTomoName", "rlnTomoParticleId"),
     ("rlnImageName",),
-    (
-        "rlnTomoName",
-        "rlnCenteredCoordinateXAngst",
-        "rlnCenteredCoordinateYAngst",
-        "rlnCenteredCoordinateZAngst",
-    ),
-    ("rlnTomoName", "rlnCoordinateX", "rlnCoordinateY", "rlnCoordinateZ"),
-    ("rlnMicrographName", "rlnCoordinateX", "rlnCoordinateY", "rlnCoordinateZ"),
 )
+# Coordinates and other workflow-dependent identifiers require explicit selection.
+# Preserve identity spelling: no numeric, path, case or coordinate normalization.
+MISSING_ID_TOKENS = frozenset((".", "?", "nan", "null", "none"))
+ParticleIdentity = tuple[str, ...]
+VERSION = "1.0.0"
 
 
 @dataclass(frozen=True)
@@ -97,6 +113,7 @@ class MergeConfig:
     previous_provenance: Path | None = None
     id_column: str | tuple[str, ...] = "auto"
     expected_total: int | None = None
+    config_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,7 +134,7 @@ class FrozenStarValidation:
     star: Path
     mode: str
     particle_count: int
-    optics_groups: tuple[int, ...]
+    optics_groups: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -133,18 +150,19 @@ class JobStarValidation:
     pool_counts: dict[str, int]
     empty_classes: tuple[int, ...]
     model_empty_classes: tuple[int, ...]
-    # None means the Phase 2B-1B check has not been performed.
+    # None means the check has not been performed.
     input_star_verified: bool | None = None
+    input_particle_count: int | None = None
     optics_groups: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
 class StarValidationReport:
-    """Active-job validation results and optional Phase 2B-1B results.
+    """Validation results for active jobs and frozen sources.
 
-    None denotes a check that has not been performed. The legacy total_particles
-    and pool_totals include configured frozen expectations, not measured frozen
-    counts; frozen pools without expected_particles contribute nothing to them.
+    None denotes a check that has not been performed. Total and pool counts are
+    measured from STAR rows; frozen_expected_particles is configuration only.
+    all_previous_inputs_verified is True only if every job's input was checked.
     """
 
     jobs: dict[str, JobStarValidation]
@@ -159,6 +177,12 @@ class StarValidationReport:
     frozen_particles: int | None = None
     unique_particle_ids: int | None = None
     all_previous_inputs_verified: bool | None = None
+    metadata_verified: bool = False
+    previous_provenance_verified: bool | None = None
+    source_blocks: dict[Path, dict[str, Any]] = field(default_factory=dict, repr=False, compare=False)
+    metadata_blocks: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    input_hashes: dict[Path, str] = field(default_factory=dict, repr=False, compare=False)
+    previous_records: dict[ParticleIdentity, dict[str, Any]] = field(default_factory=dict, repr=False, compare=False)
 
 
 def normalize_round_label(value: Any, field_name: str = "round") -> tuple[str, str]:
@@ -346,7 +370,7 @@ def parse_frozen_pools(
 
         expected_raw = entry.get("expected_particles", entry.get("expected"))
         expected_particles = (
-            parse_positive_int(expected_raw, f"frozen.{pool_name}.expected_particles")
+            parse_positive_int(expected_raw, f"frozen.{pool_name}.expected_particles", allow_zero=True)
             if expected_raw is not None
             else None
         )
@@ -630,6 +654,7 @@ def load_config(
         previous_provenance=previous_provenance,
         id_column=id_column,
         expected_total=expected_total,
+        config_sha256=hashlib.sha256(raw_bytes).hexdigest(),
     )
 
 
@@ -787,18 +812,87 @@ def parse_model_star(model_path: Path) -> ModelStarInfo:
     )
 
 
-def read_data_star(star_path: Path) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Read a RELION data STAR file and validate its particles table."""
+def check_particle_token_syntax(star_path: Path) -> None:
+    """Reject duplicate blocks and particle tokens the STAR reader can alter.
+
+    Duplicate blocks silently replace earlier blocks in the installed reader.
+    Embedded quotes are altered and unquoted hashes are truncated by the reader.
+    Ordinary outer quoting, comments and quoted hashes are supported. Multiline
+    semicolon-delimited particle values are outside this table reader's scope.
+    """
+    in_particles = False
+    in_multiline_metadata = False
+    seen_blocks: set[str] = set()
+    with star_path.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            stripped = line.strip()
+            if line.startswith(";"):
+                if in_particles:
+                    raise ValueError(
+                        f"{star_path}: unsupported multiline particle value at line {line_number}; "
+                        "use single-line STAR tokens for exact identity validation."
+                    )
+                in_multiline_metadata = not in_multiline_metadata
+                continue
+            if in_multiline_metadata:
+                continue
+            if stripped.startswith("data_"):
+                block_name = stripped.split()[0]
+                if block_name in seen_blocks:
+                    raise ValueError(
+                        f"{star_path}: duplicate STAR block {block_name!r} at line {line_number}; "
+                        "earlier particles or metadata could otherwise be silently discarded."
+                    )
+                seen_blocks.add(block_name)
+                in_particles = block_name == "data_particles"
+                continue
+            if not in_particles or not stripped or stripped.startswith(("#", "_", "loop_")):
+                continue
+            quote: str | None = None
+            for index, char in enumerate(line):
+                at_boundary = index == 0 or line[index - 1].isspace()
+                if char in ("'", '"'):
+                    if quote is None and at_boundary:
+                        quote = char
+                    elif char == quote and (index + 1 == len(line) or line[index + 1].isspace()):
+                        quote = None
+                    else:
+                        raise ValueError(
+                            f"{star_path}: embedded quote in a particle token at line {line_number}; "
+                            "the STAR parser cannot preserve these values reliably."
+                        )
+                elif char == "#" and quote is None:
+                    if at_boundary:
+                        break
+                    raise ValueError(
+                        f"{star_path}: unquoted '#' inside a particle token at line {line_number}; "
+                        "quote the whole token to prevent STAR parser truncation."
+                    )
+
+
+def read_data_star(
+    star_path: Path,
+    *,
+    require_class_numbers: bool = True,
+    id_columns: tuple[str, ...] = (),
+    allow_empty: bool = False,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Read a particles table, preserving all potential identity columns as text.
+
+    Previous inputs and frozen pools need no class assignments. Explicit columns
+    must be supplied before parsing so numeric-looking IDs retain their spelling.
+    """
     if not star_path.exists():
         raise FileNotFoundError(f"Missing RELION data STAR file: {star_path}")
     if not star_path.is_file():
         raise ValueError(f"Expected a STAR file but found directory: {star_path}")
 
+    check_particle_token_syntax(star_path)
     try:
         blocks = starfile.read(
             star_path,
             always_dict=True,
-            parse_as_string=STRING_ID_COLUMNS,
+            parse_as_string=list(dict.fromkeys([*STRING_ID_COLUMNS, *id_columns])),
         )
     except Exception as exc:
         raise ValueError(f"Failed to parse STAR file {star_path}: {exc}") from exc
@@ -809,16 +903,135 @@ def read_data_star(star_path: Path) -> tuple[dict[str, Any], pd.DataFrame]:
     particles = blocks["particles"]
     if not isinstance(particles, pd.DataFrame):
         raise ValueError(f"{star_path}: 'particles' block is not a valid table.")
-    if len(particles) == 0:
+    if len(particles) == 0 and not allow_empty:
         raise ValueError(f"{star_path}: 'particles' table is empty (0 rows).")
-    if "rlnClassNumber" not in particles.columns:
+    if len(particles) == 0:
+        # Some starfile releases omit column labels for header-only loop tables.
+        columns = []
+        in_particles = False
+        for line in star_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("data_"):
+                if in_particles:
+                    break
+                in_particles = line.split()[0] == "data_particles"
+            elif in_particles and line.startswith("_"):
+                columns.append(line.split()[0][1:])
+        if len(columns) == len(particles.columns):
+            particles.columns = columns
+    if not particles.columns.is_unique:
+        raise ValueError(f"{star_path}: duplicate particle column names.")
+    if require_class_numbers and "rlnClassNumber" not in particles.columns:
         raise ValueError(f"{star_path}: missing required column 'rlnClassNumber'.")
 
     return blocks, particles
 
 
-def validate_job_star(jcfg: JobConfig, pools: tuple[str, ...]) -> JobStarValidation:
-    """Validate a single Class3D job's data STAR and model STAR files."""
+def select_identity_columns(
+    selection: str | tuple[str, ...],
+    sources: dict[str, pd.DataFrame],
+) -> tuple[str, ...]:
+    """Select one common schema without assuming a candidate's workflow stability.
+
+    Auto selection uses column presence only, never retries another identity when
+    duplicate or invalid values are encountered. Explicit selection is required
+    for ambiguous schemas and for coordinate-based identities.
+    """
+    if selection != "auto":
+        return (selection,) if isinstance(selection, str) else selection
+
+    candidates = [
+        columns for columns in AUTO_ID_CANDIDATES
+        if all(set(columns).issubset(table.columns) for table in sources.values())
+    ]
+    if len(candidates) != 1:
+        detail = (
+            f"ambiguous candidates {candidates}"
+            if candidates else "no common identity candidate"
+        )
+        raise ValueError(
+            f"Automatic particle identity selection failed: {detail} across "
+            f"{', '.join(sources)}. Configure id_column explicitly with a stable "
+            "column or composite columns for this workflow."
+        )
+    return candidates[0]
+
+
+def identity_examples(identities: set[ParticleIdentity]) -> str:
+    """Bound diagnostic examples without sorting an entire particle collection."""
+    return ", ".join(repr(key[0] if len(key) == 1 else key) for key in nsmallest(5, identities))
+
+
+def validate_particle_identities(
+    particles: pd.DataFrame,
+    columns: tuple[str, ...],
+    source: str,
+) -> set[ParticleIdentity]:
+    """Require complete, nonempty, unique exact string keys in one source."""
+    missing_columns = [column for column in columns if column not in particles.columns]
+    if missing_columns:
+        raise ValueError(f"{source}: missing particle identity column(s): {missing_columns}.")
+
+    identities: set[ParticleIdentity] = set()
+    duplicates: set[ParticleIdentity] = set()
+    for row_number, values in enumerate(
+        particles[list(columns)].itertuples(index=False, name=None), start=1
+    ):
+        for column, value in zip(columns, values):
+            if pd.isna(value) or not isinstance(value, str):
+                raise ValueError(
+                    f"{source}: null or non-string particle ID in {column}, row {row_number}."
+                )
+            if not value.strip() or value.strip().casefold() in MISSING_ID_TOKENS:
+                raise ValueError(
+                    f"{source}: missing, null or empty particle ID {value!r} "
+                    f"in {column}, row {row_number}."
+                )
+            # starfile normalizes apostrophes to double quotes before parsing.
+            # Reject embedded quotes rather than certify a potentially altered ID.
+            # Ordinary STAR quoting around a value has already been removed.
+            if "'" in value or '"' in value:
+                raise ValueError(
+                    f"{source}: particle ID in {column}, row {row_number}, contains "
+                    "an embedded quote; the STAR parser cannot preserve these IDs "
+                    "reliably. Select a quote-free identity using id_column."
+                )
+        if values in identities:
+            duplicates.add(values)
+        identities.add(values)
+
+    if duplicates:
+        raise ValueError(
+            f"{source}: duplicate particle IDs in {columns}: "
+            f"{len(particles) - len(identities):,} duplicate row(s); "
+            f"examples: {identity_examples(duplicates)}."
+        )
+    return identities
+
+
+def register_particle_source(
+    identities: set[ParticleIdentity],
+    source: str,
+    owners: dict[ParticleIdentity, str],
+) -> None:
+    """Require active outputs and frozen pools to be mutually disjoint."""
+    overlap = identities.intersection(owners)
+    if overlap:
+        previous_sources = sorted({owners[identity] for identity in overlap})
+        raise ValueError(
+            f"Particle identity overlap: {source} shares {len(overlap):,} particle(s) "
+            f"with {', '.join(previous_sources)}; examples: {identity_examples(overlap)}."
+        )
+    owners.update(dict.fromkeys(identities, source))
+
+
+def validate_job_star(
+    jcfg: JobConfig,
+    pools: tuple[str, ...],
+    *,
+    particles: pd.DataFrame | None = None,
+) -> JobStarValidation:
+    """Validate job class/model/count consistency, optionally reusing a read table."""
     model_path = derive_model_star_path(jcfg)
     model_info = parse_model_star(model_path)
 
@@ -828,7 +1041,10 @@ def validate_job_star(jcfg: JobConfig, pools: tuple[str, ...]) -> JobStarValidat
             f"in {model_path}."
         )
 
-    _, particles = read_data_star(jcfg.star)
+    if particles is None:
+        _, particles = read_data_star(jcfg.star)
+    if "rlnClassNumber" not in particles.columns:
+        raise ValueError(f"{jcfg.star}: missing required column 'rlnClassNumber'.")
     particle_count = len(particles)
 
     if jcfg.expected_particles is not None and particle_count != jcfg.expected_particles:
@@ -915,44 +1131,763 @@ def validate_job_star(jcfg: JobConfig, pools: tuple[str, ...]) -> JobStarValidat
     )
 
 
+def metadata_value_equal(left: Any, right: Any) -> bool:
+    """Compare scalar metadata, allowing only small floating serialization noise.
+
+    The absolute tolerance covers rounding to six decimal places; the relative
+    tolerance accommodates equivalent decimal representations at larger scales.
+    Strings, booleans and integer/integer comparisons remain exact.
+    """
+    from numbers import Integral, Real
+
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, Integral) and isinstance(right, Integral):
+        return left == right
+    if pd.isna(left) or pd.isna(right):
+        return bool(pd.isna(left) and pd.isna(right))
+    if isinstance(left, Real) and isinstance(right, Real):
+        return math.isclose(float(left), float(right), rel_tol=1e-7, abs_tol=1e-6)
+    return type(left) is type(right) and left == right
+
+
+def assert_metadata_block_equal(expected: Any, actual: Any, context: str) -> None:
+    """Require equivalent scalar/table blocks, ignoring harmless table ordering."""
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        if set(expected) != set(actual):
+            raise ValueError(f"{context}: incompatible metadata fields.")
+        different = [key for key in expected if not metadata_value_equal(expected[key], actual[key])]
+        if different:
+            raise ValueError(f"{context}: incompatible metadata value(s): {different[:5]}.")
+        return
+    if not isinstance(expected, pd.DataFrame) or not isinstance(actual, pd.DataFrame):
+        raise ValueError(f"{context}: incompatible or unsupported metadata block type.")
+    if expected.columns.has_duplicates or actual.columns.has_duplicates:
+        raise ValueError(f"{context}: duplicate metadata column names.")
+    if set(expected.columns) != set(actual.columns) or len(expected) != len(actual):
+        raise ValueError(f"{context}: incompatible metadata columns or row counts.")
+    columns = list(expected.columns)
+    left_rows = list(expected[columns].itertuples(index=False, name=None))
+    right_rows = list(actual[columns].itertuples(index=False, name=None))
+    # Matching rather than sorting handles close numeric values in rows whose
+    # other fields differ. Metadata tables are small; particle tables never use it.
+    candidates = [
+        [j for j, right in enumerate(right_rows)
+         if all(metadata_value_equal(a, b) for a, b in zip(left, right))]
+        for left in left_rows
+    ]
+    matched: dict[int, int] = {}
+
+    def match_row(index: int, visited: set[int]) -> bool:
+        for candidate in candidates[index]:
+            if candidate in visited:
+                continue
+            visited.add(candidate)
+            if candidate not in matched or match_row(matched[candidate], visited):
+                matched[candidate] = index
+                return True
+        return False
+
+    if any(not match_row(index, set()) for index in range(len(left_rows))):
+        raise ValueError(f"{context}: incompatible metadata table values.")
+
+
+def assert_metadata_compatible(
+    expected_blocks: dict[str, Any], actual_blocks: dict[str, Any], context: str,
+) -> None:
+    """Require all non-particle blocks to survive a STAR round trip unchanged."""
+    expected = {key: value for key, value in expected_blocks.items() if key != "particles"}
+    actual = {key: value for key, value in actual_blocks.items() if key != "particles"}
+    if set(expected) != set(actual):
+        raise ValueError(
+            f"{context}: incompatible non-particle STAR blocks: "
+            f"expected {sorted(expected)}, found {sorted(actual)}."
+        )
+    for name, value in expected.items():
+        assert_metadata_block_equal(value, actual[name], f"{context}, data_{name}")
+
+
+def optics_group_ids(values: pd.Series, context: str) -> list[int]:
+    """Validate optics group identifiers without truncating fractional references."""
+    groups: list[int] = []
+    for value in values:
+        try:
+            if pd.api.types.is_bool(value) or pd.isna(value):
+                raise ValueError
+            numeric = pd.to_numeric(value, errors="raise")
+            group = int(numeric)
+            if not math.isfinite(float(numeric)) or numeric != group or group < 1:
+                raise ValueError
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError(f"{context}: invalid rlnOpticsGroup {value!r}; expected a positive integer.") from exc
+        groups.append(group)
+    return groups
+
+
+def validate_metadata_sources(
+    sources: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, tuple[int, ...]], bool]:
+    """Validate and combine compatible optics and other non-particle metadata.
+
+    Shared optics IDs must have matching definitions. Disjoint optics definitions
+    are retained without renumbering. Files without optics are supported only when
+    every source omits optics and particle optics references. Previous inputs use
+    the same checks as active and frozen sources.
+    """
+    if not sources:
+        raise ValueError("No STAR sources available for metadata validation.")
+    presence = {"optics" in blocks for blocks in sources.values()}
+    if len(presence) != 1:
+        raise ValueError("Incompatible metadata: mixed STAR inputs with and without data_optics.")
+    has_optics = presence.pop()
+    canonical: dict[str, Any] = {}
+    referenced_groups: dict[str, tuple[int, ...]] = {}
+    optics_columns: list[str] | None = None
+    optics_rows: dict[int, tuple[Any, ...]] = {}
+    optics_owners: dict[int, str] = {}
+    first_source: str | None = None
+
+    for source, blocks in sources.items():
+        particles = blocks.get("particles")
+        if not isinstance(particles, pd.DataFrame):
+            raise ValueError(f"{source}: missing or invalid particles table for metadata validation.")
+        if particles.columns.has_duplicates:
+            raise ValueError(f"{source}: duplicate particle column names.")
+        other = {name: block for name, block in blocks.items() if name not in ("particles", "optics")}
+        if first_source is None:
+            first_source = source
+            for name, block in other.items():
+                if not isinstance(block, (dict, pd.DataFrame)):
+                    raise ValueError(f"{source}: unsupported metadata block data_{name}.")
+                assert_metadata_block_equal(block, block, f"{source}, data_{name}")
+                canonical[name] = block.copy()
+        else:
+            baseline = {name: block for name, block in canonical.items() if name != "optics"}
+            assert_metadata_compatible(baseline, other, f"{source} versus {first_source}")
+
+        if not has_optics:
+            if "rlnOpticsGroup" in particles.columns:
+                raise ValueError(f"{source}: rlnOpticsGroup references require a data_optics block.")
+            referenced_groups[source] = ()
+            continue
+
+        optics = blocks["optics"]
+        if not isinstance(optics, pd.DataFrame) or optics.empty:
+            raise ValueError(f"{source}: data_optics must be a nonempty table.")
+        if optics.columns.has_duplicates:
+            raise ValueError(f"{source}: duplicate optics column names.")
+        if "rlnOpticsGroup" not in optics.columns:
+            raise ValueError(f"{source}: data_optics is missing rlnOpticsGroup.")
+        if "rlnOpticsGroup" not in particles.columns:
+            raise ValueError(f"{source}: particles are missing rlnOpticsGroup for data_optics.")
+        groups = optics_group_ids(optics["rlnOpticsGroup"], f"{source}, data_optics")
+        if len(groups) != len(set(groups)):
+            raise ValueError(f"{source}: duplicate rlnOpticsGroup definitions in data_optics.")
+        references = set(optics_group_ids(particles["rlnOpticsGroup"], f"{source}, data_particles"))
+        undefined = sorted(references - set(groups))
+        if undefined:
+            raise ValueError(f"{source}: undefined rlnOpticsGroup reference(s): {undefined}.")
+        referenced_groups[source] = tuple(sorted(references))
+        if optics_columns is None:
+            optics_columns = list(optics.columns)
+        elif set(optics_columns) != set(optics.columns):
+            raise ValueError(f"{source}: incompatible data_optics columns.")
+        for group, row in zip(groups, optics[optics_columns].itertuples(index=False, name=None)):
+            for column, value in zip(optics_columns, row):
+                if pd.isna(value) or (isinstance(value, str) and (not value.strip() or value.strip().casefold() in MISSING_ID_TOKENS)):
+                    raise ValueError(f"{source}: null/empty optics value in {column}, group {group}.")
+                if isinstance(value, (int, float)) and not math.isfinite(value):
+                    raise ValueError(f"{source}: non-finite optics value in {column}, group {group}.")
+            if group in optics_rows:
+                differing = [
+                    column for column, old, new in zip(optics_columns, optics_rows[group], row)
+                    if not metadata_value_equal(old, new)
+                ]
+                if differing:
+                    raise ValueError(
+                        f"{source}: conflicting optics group {group} versus {optics_owners[group]}; "
+                        f"different field(s): {differing}."
+                    )
+            else:
+                optics_rows[group] = row
+                optics_owners[group] = source
+
+    if has_optics:
+        canonical["optics"] = pd.DataFrame(list(optics_rows.values()), columns=optics_columns)
+    # Preserve the first input's block order, appending any union-only metadata.
+    first_blocks = next(iter(sources.values()))
+    canonical = {name: canonical[name] for name in first_blocks if name in canonical}
+    return canonical, referenced_groups, has_optics
+
+
 def validate_star_inputs(cfg: MergeConfig) -> StarValidationReport:
-    """Validate active job classes/models/counts; other checks remain unverified."""
+    """Validate counts, identities, previous inputs, and disjoint frozen sources."""
     job_reports: dict[str, JobStarValidation] = {}
+    frozen_reports: dict[str, FrozenStarValidation] = {}
     pool_totals: dict[str, int] = {pool: 0 for pool in cfg.pools}
+    # Use one identity schema across all outputs, frozen pools and previous inputs.
+    # Keep the parsed tables so class checks and identity checks see the same rows.
+    sources: dict[str, pd.DataFrame] = {}
+    job_sources: dict[str, str] = {}
+    input_sources: dict[str, str] = {}
+    frozen_sources: dict[str, str] = {}
+    metadata_sources: dict[str, dict[str, Any]] = {}
+    source_blocks: dict[Path, dict[str, Any]] = {}
+    input_hashes: dict[Path, str] = {}
+    explicit_columns = (
+        () if cfg.id_column == "auto"
+        else (cfg.id_column,) if isinstance(cfg.id_column, str)
+        else cfg.id_column
+    )
     active_particles = 0
 
     for job_name, jcfg in cfg.jobs.items():
-        jval = validate_job_star(jcfg, cfg.pools)
+        source = f"jobs.{job_name} output ({jcfg.star})"
+        input_hashes[jcfg.star] = sha256_file(jcfg.star)
+        model_path = derive_model_star_path(jcfg)
+        input_hashes[model_path] = sha256_file(model_path)
+        blocks, particles = read_data_star(jcfg.star, id_columns=explicit_columns)
+        source_blocks[jcfg.star] = blocks
+        metadata_sources[source] = blocks
+        sources[source] = particles
+        job_sources[job_name] = source
+        jval = validate_job_star(jcfg, cfg.pools, particles=particles)
         job_reports[job_name] = jval
         active_particles += jval.particle_count
         for pool_name, count in jval.pool_counts.items():
             pool_totals[pool_name] += count
 
+        if jcfg.input_star is not None:
+            input_source = f"jobs.{job_name} input ({jcfg.input_star})"
+            input_hashes[jcfg.input_star] = sha256_file(jcfg.input_star)
+            input_blocks, input_particles = read_data_star(
+                jcfg.input_star, require_class_numbers=False, id_columns=explicit_columns, allow_empty=True,
+            )
+            source_blocks[jcfg.input_star] = input_blocks
+            metadata_sources[input_source] = input_blocks
+            sources[input_source] = input_particles
+            input_sources[job_name] = input_source
+
+    frozen_particles = 0
     frozen_expected = sum(f.expected_particles or 0 for f in cfg.frozen.values())
     for pool_name, fcfg in cfg.frozen.items():
-        if fcfg.expected_particles is not None:
-            pool_totals[pool_name] += fcfg.expected_particles
+        source = f"frozen.{pool_name} ({fcfg.star})"
+        input_hashes[fcfg.star] = sha256_file(fcfg.star)
+        blocks, particles = read_data_star(
+            fcfg.star, require_class_numbers=False, id_columns=explicit_columns, allow_empty=True,
+        )
+        source_blocks[fcfg.star] = blocks
+        metadata_sources[source] = blocks
+        particle_count = len(particles)
+        if fcfg.expected_particles is not None and particle_count != fcfg.expected_particles:
+            raise ValueError(
+                f"frozen.{pool_name}: expected {fcfg.expected_particles:,} particles, "
+                f"found {particle_count:,} in {fcfg.star}."
+            )
+        sources[source] = particles
+        frozen_sources[pool_name] = source
+        frozen_reports[pool_name] = FrozenStarValidation(
+            pool_name=pool_name, star=fcfg.star, mode=fcfg.mode, particle_count=particle_count,
+        )
+        frozen_particles += particle_count
+        pool_totals[pool_name] += particle_count
 
-    total_particles = active_particles + frozen_expected
-    if cfg.expected_total is not None:
-        if not cfg.frozen or all(f.expected_particles is not None for f in cfg.frozen.values()):
-            if total_particles != cfg.expected_total:
+    id_columns = select_identity_columns(cfg.id_column, sources)
+    identities = {
+        source: validate_particle_identities(particles, id_columns, source)
+        for source, particles in sources.items()
+    }
+    owners: dict[ParticleIdentity, str] = {}
+    for job_name, source in job_sources.items():
+        output_ids = identities[source]
+        register_particle_source(output_ids, source, owners)
+        if job_name in input_sources:
+            input_source = input_sources[job_name]
+            input_ids = identities[input_source]
+            input_count = len(sources[input_source])
+            output_count = job_reports[job_name].particle_count
+            missing = input_ids - output_ids
+            unexpected = output_ids - input_ids
+            if missing or unexpected or input_count != output_count:
                 raise ValueError(
-                    f"Total validated particles ({total_particles:,}) does not match "
-                    f"configured expected_total ({cfg.expected_total:,})."
+                    f"jobs.{job_name}: previous input/output particle identity mismatch "
+                    f"between {input_source} and {source}; "
+                    f"input count={input_count:,}, output count={output_count:,}; "
+                    f"missing from output: {len(missing):,} "
+                    f"(examples: {identity_examples(missing) or 'none'}); "
+                    f"unexpected in output: {len(unexpected):,} "
+                    f"(examples: {identity_examples(unexpected) or 'none'})."
                 )
+            job_reports[job_name] = replace(
+                job_reports[job_name], input_star_verified=True,
+                input_particle_count=input_count,
+            )
 
-    return StarValidationReport(
+    for source in frozen_sources.values():
+        register_particle_source(identities[source], source, owners)
+
+    metadata_blocks, optics_by_source, has_optics = validate_metadata_sources(metadata_sources)
+    for job_name, source in job_sources.items():
+        job_reports[job_name] = replace(job_reports[job_name], optics_groups=optics_by_source[source])
+    for pool_name, source in frozen_sources.items():
+        frozen_reports[pool_name] = replace(frozen_reports[pool_name], optics_groups=optics_by_source[source])
+
+    total_particles = active_particles + frozen_particles
+    if cfg.expected_total is not None and total_particles != cfg.expected_total:
+        raise ValueError(
+            f"Total validated particles ({total_particles:,}) does not match "
+            f"configured expected_total ({cfg.expected_total:,})."
+        )
+
+    report = StarValidationReport(
         jobs=job_reports,
         active_particles=active_particles,
         frozen_expected_particles=frozen_expected,
         total_particles=total_particles,
         pool_totals=pool_totals,
-        # Absence of frozen inputs is known from the config. Configured frozen
-        # files have not been read, so their measured results remain unknown.
-        frozen=None if cfg.frozen else {},
-        frozen_particles=None if cfg.frozen else 0,
+        frozen=frozen_reports,
+        frozen_particles=frozen_particles,
+        id_columns=id_columns,
+        unique_particle_ids=len(owners),
+        all_previous_inputs_verified=(
+            True if all(j.input_star_verified is True for j in job_reports.values()) else None
+        ),
+        optics_groups=tuple(sorted({group for groups in optics_by_source.values() for group in groups})),
+        has_optics_block=has_optics,
+        metadata_verified=True,
+        source_blocks=source_blocks,
+        metadata_blocks=metadata_blocks,
+        input_hashes=input_hashes,
     )
+    if cfg.previous_provenance is not None:
+        input_hashes[cfg.previous_provenance] = sha256_file(cfg.previous_provenance)
+        report = replace(
+            report, previous_records=load_previous_provenance(cfg, report),
+            previous_provenance_verified=True,
+        )
+    verify_input_hashes(input_hashes)
+    # Dry-runs check output schemas and conservation too, without creating files.
+    build_output_pools(cfg, report)
+    return report
+
+
+def sha256_file(path: Path) -> str:
+    """Fingerprint a local input or staged output without loading it into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_input_hashes(hashes: dict[Path, str]) -> None:
+    for path, expected in hashes.items():
+        if sha256_file(path) != expected:
+            raise ValueError(f"Input changed after validation: {path}. Validate again before writing.")
+
+
+def particle_keys(particles: pd.DataFrame, columns: tuple[str, ...]) -> list[ParticleIdentity]:
+    """Return already validated keys in source row order."""
+    return list(particles[list(columns)].itertuples(index=False, name=None))
+
+
+def source_pool_expectations(cfg: MergeConfig, report: StarValidationReport) -> dict[ParticleIdentity, str | None]:
+    expected = {}
+    for job in cfg.jobs.values():
+        expected.update(dict.fromkeys(particle_keys(report.source_blocks[job.star]["particles"], report.id_columns), job.input_pool))
+    for pool, frozen in cfg.frozen.items():
+        expected.update(dict.fromkeys(particle_keys(report.source_blocks[frozen.star]["particles"], report.id_columns), pool))
+    return expected
+
+
+def load_previous_provenance(cfg: MergeConfig, report: StarValidationReport) -> dict[ParticleIdentity, dict[str, Any]]:
+    """Import native JSON or historical CSV without discarding prior fields."""
+    path = cfg.previous_provenance
+    columns = report.id_columns
+    records: dict[ParticleIdentity, dict[str, Any]] = {}
+    if path.suffix.lower() == ".json":
+        def reject_constant(value):
+            raise ValueError(f"{path}: invalid JSON provenance constant {value}.")
+
+        data = json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_constant)
+        if not isinstance(data, dict) or data.get("schema_version") != 1 or data.get("id_columns") != list(columns):
+            raise ValueError(f"{path}: unsupported previous provenance JSON schema or identity columns.")
+        if not isinstance(data.get("round"), str) or not data["round"].strip():
+            raise ValueError(f"{path}: previous provenance round must be a nonempty string.")
+        if cfg.previous_round is not None and data.get("round") != cfg.previous_round:
+            raise ValueError(f"{path}: previous provenance round does not match {cfg.previous_round}.")
+        rows = data.get("particles")
+        if not isinstance(rows, list):
+            raise ValueError(f"{path}: previous provenance requires a particles list.")
+        for row in rows:
+            if (not isinstance(row, dict) or not isinstance(row.get("identity"), list)
+                    or len(row["identity"]) != len(columns) or not isinstance(row.get("pool"), str)
+                    or not isinstance(row.get("history"), list)
+                    or not all(isinstance(event, dict) for event in row["history"])):
+                raise ValueError(f"{path}: malformed previous provenance particle record.")
+            if not all(isinstance(value, str) for value in row["identity"]):
+                raise ValueError(f"{path}: provenance identities must be strings.")
+            if not row["pool"].strip():
+                raise ValueError(f"{path}: previous provenance pool must be nonempty.")
+            legacy = row.get("legacy_fields", {})
+            if not isinstance(legacy, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in legacy.items()):
+                raise ValueError(f"{path}: provenance legacy_fields must map strings to strings.")
+            key = tuple(row["identity"])
+            if key in records:
+                raise ValueError(f"{path}: duplicate provenance identity {key!r}.")
+            records[key] = row
+    elif path.suffix.lower() == ".csv":
+        if cfg.previous_round is None:
+            raise ValueError(f"{path}: previous_round is required to interpret historical CSV provenance.")
+        pool_column = f"{cfg.previous_round.lower()}_pool"
+        with path.open(encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            headers = reader.fieldnames or []
+            if len(set(headers)) != len(headers) or not set((*columns, pool_column)).issubset(headers):
+                raise ValueError(f"{path}: unsupported historical provenance CSV; requires unique identity columns and {pool_column}.")
+            for row in reader:
+                if None in row or any(value is None for value in row.values()):
+                    raise ValueError(f"{path}: malformed historical provenance CSV row.")
+                key = tuple(row[column] for column in columns)
+                if key in records:
+                    raise ValueError(f"{path}: duplicate provenance identity {key!r}.")
+                records[key] = {"identity": list(key), "pool": row[pool_column], "history": [], "legacy_fields": row}
+    else:
+        raise ValueError(f"{path}: unsupported previous provenance format; use native JSON v1 or historical CSV.")
+
+    validate_particle_identities(pd.DataFrame(list(records), columns=columns), columns, str(path))
+    expected = source_pool_expectations(cfg, report)
+    missing, extra = set(expected) - records.keys(), records.keys() - set(expected)
+    if missing or extra:
+        raise ValueError(
+            f"{path}: provenance identity coverage mismatch; missing {len(missing):,} "
+            f"({identity_examples(missing)}), unexpected {len(extra):,} ({identity_examples(extra)})."
+        )
+    for key, pool in expected.items():
+        if pool is not None and records[key]["pool"] != pool:
+            raise ValueError(f"{path}: previous provenance pool mismatch for {key!r}: expected {pool!r}, found {records[key]['pool']!r}.")
+    return records
+
+
+def build_output_pools(cfg: MergeConfig, report: StarValidationReport) -> dict[str, dict[str, Any]]:
+    """Route source rows deterministically and prove complete identity conservation."""
+    if report.id_columns is None or not report.metadata_verified:
+        raise ValueError("Complete identity and metadata validation is required before merging.")
+    outputs = {}
+    owners: dict[ParticleIdentity, str] = {}
+    default_table = report.source_blocks[next(iter(cfg.jobs.values())).star]["particles"]
+    for pool in cfg.pools:
+        parts = []
+        frozen = cfg.frozen.get(pool)
+        if frozen is not None:
+            parts.append(report.source_blocks[frozen.star]["particles"])
+        for job in cfg.jobs.values():
+            assigned = job.classes.get(pool, [])
+            if assigned:
+                if frozen is not None and frozen.mode == "copy_only":
+                    raise ValueError(f"Pool {pool}: copy_only forbids active class assignments.")
+                table = report.source_blocks[job.star]["particles"]
+                selected = table.loc[pd.to_numeric(table["rlnClassNumber"]).isin(assigned)]
+                if len(selected):
+                    parts.append(selected)
+        columns = list(parts[0].columns if parts else default_table.columns)
+        for part in parts:
+            if set(part.columns) != set(columns):
+                raise ValueError(f"Pool {pool}: incompatible particle columns; missing {sorted(set(columns)-set(part.columns))}, extra {sorted(set(part.columns)-set(columns))}.")
+        particles = (
+            pd.concat([part.loc[:, columns] for part in parts], ignore_index=True)
+            if parts else default_table.iloc[:0].copy()
+        )
+        offset = 0
+        for part in parts:
+            assert_particle_values_equal(
+                part.loc[:, columns], particles.iloc[offset:offset + len(part)],
+                f"Pool {pool}: concatenation", serialized=False,
+            )
+            offset += len(part)
+        ids = validate_particle_identities(particles, report.id_columns, f"output pool {pool}")
+        register_particle_source(ids, f"output pool {pool}", owners)
+        if len(particles) != report.pool_totals[pool]:
+            raise ValueError(f"Pool {pool}: output particle count differs from validated routing count.")
+        metadata = (
+            {key: value for key, value in report.source_blocks[frozen.star].items() if key != "particles"}
+            if frozen is not None and frozen.mode == "copy_only" else report.metadata_blocks
+        )
+        outputs[pool] = {**metadata, "particles": particles}
+    expected = source_pool_expectations(cfg, report)
+    if set(owners) != set(expected) or len(owners) != report.total_particles:
+        raise ValueError("Output particle conservation failed: input/output identity unions or counts differ.")
+    return outputs
+
+
+def build_provenance(cfg: MergeConfig, report: StarValidationReport, outputs: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Append current origins to prior lineage, retaining unknown historical fields."""
+    origins = {}
+    for job in cfg.jobs.values():
+        table = report.source_blocks[job.star]["particles"]
+        class_to_pool = {number: pool for pool, numbers in job.classes.items() for number in numbers}
+        iteration = re.search(r"_it(\d+)_", job.star.name)
+        for key, number in zip(particle_keys(table, report.id_columns), table["rlnClassNumber"]):
+            origins[key] = {
+                "round": cfg.round_label, "pool": class_to_pool[int(number)],
+                "source_type": "job", "source": job.name, "source_star": str(job.star),
+                "input_pool": job.input_pool or report.previous_records.get(key, {}).get("pool"),
+                "class_number": int(number),
+                "iteration": int(iteration.group(1)) if iteration else None,
+            }
+    for pool, frozen in cfg.frozen.items():
+        for key in particle_keys(report.source_blocks[frozen.star]["particles"], report.id_columns):
+            origins[key] = {
+                "round": cfg.round_label, "pool": pool, "source_type": "frozen",
+                "source": frozen.source_label or f"FROZEN_{cfg.previous_round.upper() if cfg.previous_round else pool.upper()}",
+                "source_star": str(frozen.star), "input_pool": pool, "class_number": None,
+                "iteration": None, "mode": frozen.mode,
+            }
+    records = []
+    for pool, blocks in outputs.items():
+        for key in particle_keys(blocks["particles"], report.id_columns):
+            previous = report.previous_records.get(key, {})
+            record = dict(previous)
+            record.update(identity=list(key), pool=pool, history=[*previous.get("history", []), origins[key]])
+            records.append(record)
+    return {"schema_version": 1, "round": cfg.round_label, "id_columns": list(report.id_columns), "particles": records}
+
+
+def effective_config_toml(cfg: MergeConfig) -> str:
+    """Serialize the supported schema without a TOML-writing dependency."""
+    def assignment(key, value):
+        if isinstance(value, Path):
+            value = str(value)
+        if isinstance(value, tuple):
+            value = list(value)
+        return f"{key} = {json.dumps(value, ensure_ascii=False)}"
+
+    lines = []
+    for key in ("round", "previous_round", "project_dir", "output_dir", "pools", "id_column", "expected_total", "previous_provenance"):
+        value = cfg.round_label if key == "round" else getattr(cfg, key)
+        if value is not None:
+            lines.append(assignment(key, value))
+    for pool, frozen in cfg.frozen.items():
+        lines.extend(["", f"[frozen.{json.dumps(pool)}]"])
+        for key in ("star", "mode", "expected_particles", "source_label"):
+            if getattr(frozen, key) is not None:
+                lines.append(assignment(key, getattr(frozen, key)))
+    for name, job in cfg.jobs.items():
+        lines.extend(["", f"[jobs.{json.dumps(name)}]"])
+        for key in ("star", "k", "input_pool", "input_star", "model_star", "expected_particles", "note"):
+            if getattr(job, key) is not None:
+                lines.append(assignment(key, getattr(job, key)))
+        lines.append(f"[jobs.{json.dumps(name)}.classes]")
+        for pool, numbers in job.classes.items():
+            lines.append(assignment(json.dumps(pool), numbers))
+    return "\n".join(lines) + "\n"
+
+
+def write_provenance_csv(path: Path, provenance: dict[str, Any]) -> None:
+    """Provide a cumulative flat view while JSON retains full structured lineage."""
+    rows = []
+    headers = list(provenance["id_columns"])
+    seen = set(headers)
+    for record in provenance["particles"]:
+        row = dict(record.get("legacy_fields", {}))
+        row.update(zip(provenance["id_columns"], record["identity"]))
+        for event in record["history"]:
+            if not isinstance(event.get("round"), str) or "source_type" not in event:
+                continue
+            prefix = event["round"].lower()
+            row.update({
+                f"{prefix}_source_job": event.get("source", ""),
+                f"{prefix}_source_class": "" if event.get("class_number") is None else str(event["class_number"]),
+                f"{prefix}_pool": event.get("pool", ""),
+                f"{prefix}_frozen": str(event["source_type"] == "frozen").lower(),
+            })
+        for key in row:
+            if key not in seen:
+                headers.append(key)
+                seen.add(key)
+        rows.append(row)
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def assert_particle_values_equal(expected: pd.DataFrame, actual: pd.DataFrame, context: str, *, serialized: bool) -> None:
+    """Catch integer precision loss as well as other metadata changes.
+
+    Pandas' numeric tolerance can hide int-to-float rounding of large integers;
+    use Python scalar equality for integers even when dtypes differ.
+    """
+    if list(expected.columns) != list(actual.columns) or len(expected) != len(actual):
+        raise ValueError(f"{context}: particle schema/count mismatch.")
+    for row_number, (left, right) in enumerate(zip(
+        expected.itertuples(index=False, name=None), actual.itertuples(index=False, name=None),
+    ), start=1):
+        for column, old, new in zip(expected.columns, left, right):
+            if pd.isna(old) or pd.isna(new):
+                equal = bool(pd.isna(old) and pd.isna(new))
+            elif isinstance(old, Integral) or isinstance(new, Integral):
+                old = old.item() if hasattr(old, "item") else old
+                new = new.item() if hasattr(new, "item") else new
+                equal = old == new
+            elif serialized and isinstance(old, float) and isinstance(new, float):
+                equal = math.isclose(old, new, rel_tol=1e-12, abs_tol=1e-12)
+            else:
+                equal = old == new
+            if not equal:
+                raise ValueError(f"{context}: particle metadata changed in {column}, row {row_number}: {old!r} -> {new!r}.")
+
+
+def verify_written_star(path: Path, expected_blocks: dict[str, Any], id_columns: tuple[str, ...]) -> set[ParticleIdentity]:
+    """Read back a staged STAR and check identities, every particle value and metadata."""
+    actual_blocks, actual = read_data_star(path, require_class_numbers=False, id_columns=id_columns, allow_empty=True)
+    expected = expected_blocks["particles"]
+    ids = validate_particle_identities(actual, id_columns, str(path))
+    if particle_keys(actual, id_columns) != particle_keys(expected, id_columns):
+        raise ValueError(f"{path}: STAR round-trip identity or row-order mismatch.")
+    if list(actual.columns) != list(expected.columns) or len(actual) != len(expected):
+        raise ValueError(f"{path}: STAR round-trip particle schema/count mismatch.")
+    assert_particle_values_equal(expected, actual, f"{path}: STAR round-trip", serialized=True)
+    validate_metadata_sources({str(path): actual_blocks})
+    assert_metadata_compatible(expected_blocks, actual_blocks, str(path))
+    return ids
+
+
+def publish_directory(staging: Path, output: Path) -> None:
+    """Publish complete sibling storage atomically, without replacing any target.
+
+    GPFS may not implement RENAME_NOREPLACE. An atomic directory symlink is the
+    fallback: its private sibling storage must then remain beside the final link.
+    Neither path uses an unsafe exists-check followed by an overwriting rename.
+    """
+    if staging.parent.resolve() != output.parent.resolve():
+        raise ValueError("Atomic publication requires sibling staging and output directories.")
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(libc, "renameat2", None)
+    if rename is not None:
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(-100, os.fsencode(staging), -100, os.fsencode(output), 1) == 0:
+            return
+        error = ctypes.get_errno()
+        if error not in (errno.EINVAL, errno.ENOSYS, errno.ENOTSUP):
+            raise OSError(error, os.strerror(error), str(output))
+    os.symlink(staging.name, output, target_is_directory=True)
+
+
+def execute_merge(
+    cfg: MergeConfig,
+    report: StarValidationReport,
+    *,
+    allow_unverified_inputs: bool = False,
+    config_path: Path | None = None,
+    argv: list[str] | None = None,
+) -> Path:
+    """Stage, verify, and atomically publish one complete, non-overwriting result."""
+    output = cfg.output_dir.absolute()
+    if os.path.lexists(output):
+        raise FileExistsError(f"Output already exists; refusing to overwrite: {output}")
+    missing = [name for name, job in report.jobs.items() if job.input_star_verified is not True]
+    if missing and not allow_unverified_inputs:
+        raise ValueError(
+            f"Previous input verification is missing for {missing}. Configure input_star "
+            "or explicitly use --allow-unverified-inputs to record incomplete lineage."
+        )
+    if config_path is not None and cfg.config_sha256 is not None:
+        if sha256_file(config_path) != cfg.config_sha256:
+            raise ValueError(f"Configuration changed after loading: {config_path}.")
+        report.input_hashes[config_path] = cfg.config_sha256
+    verify_input_hashes(report.input_hashes)
+    pools = build_output_pools(cfg, report)
+    provenance = build_provenance(cfg, report, pools)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.data-", dir=output.parent))
+    try:
+        published_ids: dict[ParticleIdentity, str] = {}
+        output_manifest = {}
+        for pool, blocks in pools.items():
+            count = len(blocks["particles"])
+            filename = f"particles_{cfg.round_label}_{pool}_{count}.star"
+            path = staging / filename
+            frozen = cfg.frozen.get(pool)
+            copy_only = frozen is not None and frozen.mode == "copy_only"
+            if copy_only:
+                shutil.copyfile(frozen.star, path)
+                if sha256_file(path) != report.input_hashes[frozen.star]:
+                    raise ValueError(f"Pool {pool}: frozen copy differs from the validated input bytes.")
+            else:
+                starfile.write(blocks, path, float_format="%.17g", quote_all_strings=True)
+            ids = verify_written_star(path, blocks, report.id_columns)
+            register_particle_source(ids, f"written pool {pool}", published_ids)
+            output_manifest[pool] = {
+                "file": filename, "count": count, "sha256": sha256_file(path),
+                "mode": frozen.mode if frozen is not None else "active",
+            }
+        expected = source_pool_expectations(cfg, report)
+        if set(published_ids) != set(expected) or len(published_ids) != report.total_particles:
+            raise ValueError("Written STAR outputs failed complete particle identity conservation.")
+        if {tuple(record["identity"]) for record in provenance["particles"]} != set(published_ids):
+            raise ValueError("Provenance identities differ from written output identities.")
+
+        (staging / "config.toml").write_text(effective_config_toml(cfg), encoding="utf-8")
+        if config_path is not None:
+            shutil.copyfile(config_path, staging / "source_config.toml")
+        if cfg.previous_provenance is not None:
+            shutil.copyfile(cfg.previous_provenance, staging / f"previous_provenance{cfg.previous_provenance.suffix.lower()}")
+        with (staging / "provenance.json").open("w", encoding="utf-8") as stream:
+            json.dump(provenance, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            stream.write("\n")
+        write_provenance_csv(staging / "provenance.csv", provenance)
+        summary = format_validation_summary(cfg, report)
+        summary += f"\nOutput identity conservation: confirmed ({report.total_particles:,} particles).\n"
+        if missing:
+            summary += f"Incomplete previous-input verification explicitly allowed for: {', '.join(missing)}.\n"
+        (staging / "summary.txt").write_text(summary, encoding="utf-8")
+        software = {"class_pool_merge": VERSION, "python": sys.version.split()[0]}
+        software["implementation_sha256"] = sha256_file(Path(__file__))
+        for package in ("pandas", "starfile"):
+            software[package] = importlib.metadata.version(package)
+        manifest = {
+            "schema_version": 1, "round": cfg.round_label,
+            "created_utc": datetime.now(timezone.utc).isoformat(), "software": software,
+            "config": tomllib.loads(effective_config_toml(cfg)),
+            "execution": {"argv": argv or [], "config_path": str(config_path) if config_path else None,
+                          "allow_unverified_inputs": allow_unverified_inputs},
+            "validation": {"input_output_conserved": True, "metadata_verified": report.metadata_verified,
+                           "previous_inputs_verified": [name for name in cfg.jobs if name not in missing],
+                           "all_previous_inputs_verified": report.all_previous_inputs_verified,
+                           "previous_provenance_verified": report.previous_provenance_verified},
+            "counts": {"active": report.active_particles, "frozen": report.frozen_particles,
+                       "total": report.total_particles, "unique": report.unique_particle_ids, "pools": report.pool_totals},
+            "jobs": {name: {"star": str(job.data_star), "model_star": str(job.model_star),
+                             "k": job.k, "particle_count": job.particle_count,
+                             "class_counts": job.class_counts, "pool_counts": job.pool_counts,
+                             "empty_classes": job.empty_classes, "input_star_verified": job.input_star_verified}
+                     for name, job in report.jobs.items()},
+            "inputs": [{"path": str(path), "sha256": digest} for path, digest in report.input_hashes.items()],
+            "outputs": output_manifest,
+            "files": {path.name: sha256_file(path) for path in sorted(staging.iterdir())},
+        }
+        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        verify_input_hashes(report.input_hashes)
+        for path in staging.iterdir():
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+        publish_directory(staging, output)
+    except BaseException:
+        # A signal may arrive just after symlink publication. Never remove storage
+        # already reachable through the final link, even if the syscall's caller
+        # did not get to observe its successful return.
+        try:
+            published_backing = output.is_symlink() and os.readlink(output) == staging.name
+        except OSError:
+            published_backing = True  # Retain storage if publication cannot be inspected.
+        if not published_backing:
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return output
 
 
 def format_validation_summary(
@@ -977,7 +1912,12 @@ def format_validation_summary(
         lines.append(f"Frozen pools ({len(cfg.frozen)}):")
         for pool_name, fcfg in cfg.frozen.items():
             exp = f", expected={fcfg.expected_particles:,}" if fcfg.expected_particles is not None else ""
-            lines.append(f"  - {pool_name}: mode={fcfg.mode}{exp} ({fcfg.star})")
+            measured = ""
+            if star_report is not None and star_report.frozen is not None:
+                fval = star_report.frozen.get(pool_name)
+                if fval is not None:
+                    measured = f", particles={fval.particle_count:,} (count verified)"
+            lines.append(f"  - {pool_name}: mode={fcfg.mode}{measured}{exp} ({fcfg.star})")
 
     lines.append("")
     lines.append(f"Active Class3D jobs ({len(cfg.jobs)}):")
@@ -993,6 +1933,15 @@ def format_validation_summary(
                 ", ".join(map(str, jval.empty_classes)) if jval.empty_classes else "none"
             )
             lines.append(f"      Zero-particle classes : {empty_str}")
+            if jval.input_star_verified is True:
+                lines.append(
+                    f"      Previous input: identity match confirmed "
+                    f"({jval.input_particle_count:,} particles; {jcfg.input_star})"
+                )
+            elif jcfg.input_star is None:
+                lines.append("      Previous input: not performed (input_star not configured)")
+            else:
+                lines.append("      Previous input: not verified")
             for pool_name in cfg.pools:
                 assigned = jcfg.classes.get(pool_name, [])
                 if assigned or jval.pool_counts.get(pool_name, 0) > 0:
@@ -1024,13 +1973,41 @@ def format_validation_summary(
             lines.append(f"  {pool_name:14s}: {count:>8,d} ({pct:6.2f}%)")
         lines.append(f"  {'TOTAL':14s}: {star_report.total_particles:>8,d}")
 
+        lines.append("")
+        if star_report.id_columns is not None and star_report.unique_particle_ids is not None:
+            lines.append(
+                f"Identity checks confirmed: {', '.join(star_report.id_columns)}; "
+                f"{star_report.unique_particle_ids:,} unique particles; sources disjoint."
+            )
+            if cfg.id_column == "auto":
+                lines.append(
+                    "  Auto selected the sole common candidate; identity stability "
+                    "outside these files is not established."
+                )
+        if cfg.frozen and star_report.frozen is not None:
+            lines.append(
+                f"Frozen checks confirmed: {len(star_report.frozen)} pool(s), "
+                f"{star_report.frozen_particles:,} particles; counts, uniqueness and disjointness."
+            )
+        elif not cfg.frozen:
+            lines.append("Frozen checks: not applicable (no frozen pools configured).")
+
+        verified_inputs = sum(j.input_star_verified is True for j in star_report.jobs.values())
+        lines.append(f"Previous inputs verified: {verified_inputs}/{len(cfg.jobs)} jobs.")
+        if star_report.metadata_verified:
+            optics = f"groups {star_report.optics_groups}" if star_report.has_optics_block else "no optics blocks or group references"
+            lines.append(f"Optics and metadata compatibility: confirmed ({optics}).")
+        if star_report.previous_provenance_verified:
+            lines.append("Previous provenance: identity coverage and configured source pools confirmed; lineage retained.")
         pending_checks = []
         if star_report.id_columns is None or star_report.unique_particle_ids is None:
             pending_checks.append("particle identity/uniqueness")
         if star_report.optics_groups is None or star_report.has_optics_block is None:
             pending_checks.append("optics compatibility")
-        if star_report.all_previous_inputs_verified is None:
-            pending_checks.append("previous inputs")
+        if star_report.all_previous_inputs_verified is not True:
+            pending_checks.append("previous inputs for jobs without a verified input_star")
+        if star_report.previous_provenance_verified is not True:
+            pending_checks.append("previous provenance (not configured; current origins will be recorded)")
         if pending_checks:
             lines.append("")
             lines.append(f"Checks not yet performed: {', '.join(pending_checks)}.")
@@ -1076,6 +2053,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate configuration and inputs without writing output files.",
     )
+    parser.add_argument(
+        "--allow-unverified-inputs", action="store_true",
+        help="Allow output when a job lacks input_star, recording incomplete previous-input verification.",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
 
 
@@ -1100,12 +2082,18 @@ def main(argv: list[str] | None = None) -> int:
         print("Configuration and STAR input validation succeeded (--dry-run).")
         return 0
 
-    print(
-        "ERROR: Particle merging and STAR output writing are not yet implemented "
-        "(use --dry-run to validate configuration and STAR inputs).",
-        file=sys.stderr,
-    )
-    return 1
+    try:
+        output = execute_merge(
+            cfg, star_report, allow_unverified_inputs=args.allow_unverified_inputs,
+            config_path=args.config.resolve(), argv=list(sys.argv[1:] if argv is None else argv),
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"Published validated outputs: {output}")
+    if output.is_symlink():
+        print(f"Filesystem publication uses a directory symlink; keep {output} and its backing directory {output.resolve()} together.")
+    return 0
 
 
 if __name__ == "__main__":
