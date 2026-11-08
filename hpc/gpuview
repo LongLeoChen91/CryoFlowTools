@@ -237,7 +237,7 @@ def get_node_data(partition: str, debug: bool = False) -> dict:
             "state": node_info.get(
                 "State",
                 "UNKNOWN",
-            ).replace("+DRAIN", ""),
+            ),
             "cpus_load": node_info.get("CPULoad", "N/A"),
             "cpus_alloc": node_info.get("CPUAlloc", "0"),
             "cpus_total": node_info.get("CPUTot", "0"),
@@ -251,6 +251,27 @@ def get_node_data(partition: str, debug: bool = False) -> dict:
         }
 
     return nodes
+
+
+def get_state_color(state: str) -> str:
+    """
+    Determine the display color for a Slurm node state string.
+    """
+    upper_state = state.upper()
+
+    if any(
+        flag in upper_state
+        for flag in ("DRAIN", "DOWN", "NOT_RESPONDING", "FAIL")
+    ):
+        return "red"
+
+    if any(flag in upper_state for flag in ("PLANNED", "MIX")):
+        return "yellow"
+
+    if "IDLE" in upper_state:
+        return "green"
+
+    return "red"
 
 
 def parse_squeue(output: str) -> dict:
@@ -359,13 +380,7 @@ def main() -> None:
 
         state = node["state"].upper()
 
-        state_color = (
-            "green"
-            if "IDLE" in state
-            else "yellow"
-            if "MIX" in state
-            else "red"
-        )
+        state_color = get_state_color(state)
 
         gpu_info = node.get("gpus", {})
         gpu_model = node.get("gpu_model")
