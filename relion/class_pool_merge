@@ -81,6 +81,7 @@ class FrozenPoolConfig:
     mode: str = "copy_only"
     expected_particles: int | None = None
     source_label: str | None = None
+    input_pool: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,7 @@ class FrozenStarValidation:
     mode: str
     particle_count: int
     optics_groups: tuple[int, ...] | None = None
+    input_pool: str | None = None
 
 
 @dataclass(frozen=True)
@@ -368,6 +370,16 @@ def parse_frozen_pools(
                 f"frozen.{pool_name}.mode must be one of {list(VALID_FROZEN_MODES)}, got {mode!r}."
             )
 
+        input_pool = entry.get("input_pool")
+        if input_pool is not None:
+            if not isinstance(input_pool, str) or not input_pool.strip():
+                raise ValueError(f"frozen.{pool_name}.input_pool must be a non-empty string.")
+            input_pool = input_pool.strip()
+            if not SAFE_NAME_RE.fullmatch(input_pool):
+                raise ValueError(
+                    f"frozen.{pool_name}.input_pool {input_pool!r} contains invalid characters."
+                )
+
         expected_raw = entry.get("expected_particles", entry.get("expected"))
         expected_particles = (
             parse_positive_int(expected_raw, f"frozen.{pool_name}.expected_particles", allow_zero=True)
@@ -388,6 +400,7 @@ def parse_frozen_pools(
             mode=mode,
             expected_particles=expected_particles,
             source_label=source_label.strip(),
+            input_pool=input_pool,
         )
 
     return frozen_configs
@@ -1389,7 +1402,11 @@ def validate_star_inputs(cfg: MergeConfig) -> StarValidationReport:
         sources[source] = particles
         frozen_sources[pool_name] = source
         frozen_reports[pool_name] = FrozenStarValidation(
-            pool_name=pool_name, star=fcfg.star, mode=fcfg.mode, particle_count=particle_count,
+            pool_name=pool_name,
+            star=fcfg.star,
+            mode=fcfg.mode,
+            particle_count=particle_count,
+            input_pool=fcfg.input_pool,
         )
         frozen_particles += particle_count
         pool_totals[pool_name] += particle_count
@@ -1498,7 +1515,7 @@ def source_pool_expectations(cfg: MergeConfig, report: StarValidationReport) -> 
     for job in cfg.jobs.values():
         expected.update(dict.fromkeys(particle_keys(report.source_blocks[job.star]["particles"], report.id_columns), job.input_pool))
     for pool, frozen in cfg.frozen.items():
-        expected.update(dict.fromkeys(particle_keys(report.source_blocks[frozen.star]["particles"], report.id_columns), pool))
+        expected.update(dict.fromkeys(particle_keys(report.source_blocks[frozen.star]["particles"], report.id_columns), frozen.input_pool or pool))
     return expected
 
 
@@ -1550,6 +1567,8 @@ def load_previous_provenance(cfg: MergeConfig, report: StarValidationReport) -> 
             for row in reader:
                 if None in row or any(value is None for value in row.values()):
                     raise ValueError(f"{path}: malformed historical provenance CSV row.")
+                if not row[pool_column].strip():
+                    raise ValueError(f"{path}: previous provenance pool must be nonempty.")
                 key = tuple(row[column] for column in columns)
                 if key in records:
                     raise ValueError(f"{path}: duplicate provenance identity {key!r}.")
@@ -1642,7 +1661,7 @@ def build_provenance(cfg: MergeConfig, report: StarValidationReport, outputs: di
             origins[key] = {
                 "round": cfg.round_label, "pool": pool, "source_type": "frozen",
                 "source": frozen.source_label or f"FROZEN_{cfg.previous_round.upper() if cfg.previous_round else pool.upper()}",
-                "source_star": str(frozen.star), "input_pool": pool, "class_number": None,
+                "source_star": str(frozen.star), "input_pool": frozen.input_pool or pool, "class_number": None,
                 "iteration": None, "mode": frozen.mode,
             }
     records = []
@@ -1671,7 +1690,7 @@ def effective_config_toml(cfg: MergeConfig) -> str:
             lines.append(assignment(key, value))
     for pool, frozen in cfg.frozen.items():
         lines.extend(["", f"[frozen.{json.dumps(pool)}]"])
-        for key in ("star", "mode", "expected_particles", "source_label"):
+        for key in ("star", "input_pool", "mode", "expected_particles", "source_label"):
             if getattr(frozen, key) is not None:
                 lines.append(assignment(key, getattr(frozen, key)))
     for name, job in cfg.jobs.items():
@@ -1825,6 +1844,8 @@ def execute_merge(
                 "file": filename, "count": count, "sha256": sha256_file(path),
                 "mode": frozen.mode if frozen is not None else "active",
             }
+            if frozen is not None and frozen.input_pool is not None:
+                output_manifest[pool]["input_pool"] = frozen.input_pool
         expected = source_pool_expectations(cfg, report)
         if set(published_ids) != set(expected) or len(published_ids) != report.total_particles:
             raise ValueError("Written STAR outputs failed complete particle identity conservation.")
@@ -1911,13 +1932,14 @@ def format_validation_summary(
         lines.append("")
         lines.append(f"Frozen pools ({len(cfg.frozen)}):")
         for pool_name, fcfg in cfg.frozen.items():
+            in_pool = f", input_pool={fcfg.input_pool}" if fcfg.input_pool else ""
             exp = f", expected={fcfg.expected_particles:,}" if fcfg.expected_particles is not None else ""
             measured = ""
             if star_report is not None and star_report.frozen is not None:
                 fval = star_report.frozen.get(pool_name)
                 if fval is not None:
                     measured = f", particles={fval.particle_count:,} (count verified)"
-            lines.append(f"  - {pool_name}: mode={fcfg.mode}{measured}{exp} ({fcfg.star})")
+            lines.append(f"  - {pool_name}: mode={fcfg.mode}{in_pool}{measured}{exp} ({fcfg.star})")
 
     lines.append("")
     lines.append(f"Active Class3D jobs ({len(cfg.jobs)}):")

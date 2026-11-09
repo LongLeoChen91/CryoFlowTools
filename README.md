@@ -164,8 +164,9 @@ expected_particles = 250
 `copy_only` preserves that STAR byte-for-byte and forbids new class assignments
 to the pool. Explicit `mode = "append"` allows new assignments: existing frozen
 rows come first, followed by selected rows in configured job order, preserving
-each source's row order. Multiple frozen pools are supported. Their identities
-must be unique and disjoint from every other active or frozen source.
+each source's row order. Set optional `input_pool` when carrying a previous-round
+pool into a differently named output pool. Multiple frozen pools are supported.
+Their identities must be unique and disjoint from every other active or frozen source.
 
 Outputs include `particles_<round>_<pool>_<count>.star` for every pool, including
 header-only STAR tables for empty pools, plus `manifest.json`, `summary.txt`,
