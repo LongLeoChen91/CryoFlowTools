@@ -8,6 +8,7 @@ workflows on HPC clusters.
 | Tool | Location | Description |
 |------|----------|-------------|
 | `gpuview` | `hpc/` | Summarises Slurm GPU-node resources and running jobs |
+| `nodeplan` | `hpc/` | Read-only Slurm node availability check: state, free GPUs, blockers, and predicted schedule |
 | `jobdiag` | `hpc/` | Read-only Slurm job diagnostics for pending reasons, resource fit, and scheduler state |
 | `missali_report` | `missalignment/` | Summarises MissAlignment `*_alignment_loss.json` results |
 | `class_distribution` | `relion/` | Tracks RELION Class3D class distributions across iterations |
@@ -29,7 +30,7 @@ pip install -r requirements.txt
 The scripts are standalone executables. Make them executable if needed:
 
 ```bash
-chmod +x hpc/gpuview hpc/jobdiag relion/class_distribution relion/compare_class3d_jobs relion/class_pool_merge relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
+chmod +x hpc/gpuview hpc/nodeplan hpc/jobdiag relion/class_distribution relion/compare_class3d_jobs relion/class_pool_merge relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
 ```
 
 `m_resolution` and `m_progressive` use only the Python standard library.
@@ -47,6 +48,23 @@ Display Slurm GPU partition status (run on a login node):
 hpc/gpuview
 hpc/gpuview gpu_strubi
 ```
+
+### nodeplan
+
+Check whether a node can be used now, and if not, why:
+
+```bash
+hpc/nodeplan compg027
+hpc/nodeplan compg037 --verbose
+```
+
+The default output is a short summary: node state, free GPUs, the main blocker (`DRAIN`, `DOWN`, `PLANNED`, or fully allocated), the next job Slurm predicts for the node, and an availability verdict of `NOW`, `NO`, or `UNKNOWN`. `--verbose` adds node resources, running jobs, planned jobs, and the commands executed.
+
+A node name Slurm does not define is reported as `NOT DEFINED` (exit code 2), which is different from a drained or down node; `sinfo` omits nodes that belong to no partition, so it cannot confirm a name.
+
+`nodeplan` is strictly read-only and uses only `scontrol show` and `squeue`.
+
+> Start times are Slurm estimates that change every scheduling cycle, not guarantees. `nodeplan` never treats `PLANNED` as a reservation window and reports availability as `UNKNOWN` unless the evidence establishes it.
 
 ### jobdiag
 

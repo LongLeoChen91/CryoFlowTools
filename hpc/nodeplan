@@ -1,0 +1,692 @@
+#!/apps/strubi/software/packages/miniforge3/envs/miss-alignment/bin/python
+
+"""
+nodeplan
+
+Read-only Slurm node availability check for a single compute node.
+
+Answers three questions with a short summary:
+
+    1. Can I use this node now?          -> Available: NOW / NO / UNKNOWN
+    2. If not, what is blocking it?      -> Blocker: DRAIN / DOWN / PLANNED /
+                                            no partition / fully allocated
+    3. When might resources free up?     -> Next: the next job Slurm predicts
+                                            for the node (start -> end)
+
+NOW means the node is schedulable and has unallocated resources; it is not a
+guarantee that any particular job will start (account, partition and priority
+limits are not checked; use jobdiag for a specific job). Slurm start times are
+estimates that change every scheduling cycle, a predicted end is only
+start + TimeLimit, and PLANNED is never treated as a reservation window.
+Availability is UNKNOWN unless the evidence establishes it.
+
+A node name Slurm does not define (no scontrol record) is reported as NOT
+DEFINED, which is distinct from a DOWN or DRAINED node and from a failed query.
+Use --verbose to also list running jobs, planned jobs, node resources, and the
+commands executed.
+
+Usage:
+    nodeplan NODE [--verbose] [--no-color]
+
+Examples:
+    nodeplan compg027
+    nodeplan compg037 --verbose
+
+Exit codes: 0 ok, 1 usage or query error, 2 node not defined in Slurm.
+Only read-only Slurm commands are executed (scontrol show, squeue).
+
+Developed and maintained by Long Chen.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import re
+import shlex
+import subprocess
+import sys
+from typing import Callable
+
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+ALLOWED_COMMAND_PREFIXES = (("scontrol", "show"), ("squeue",))
+FORBIDDEN_SCONTROL_WORDS = frozenset(
+    {"update", "requeue", "requeuehold", "hold", "uhold", "release", "suspend",
+     "resume", "top", "create", "delete", "shutdown", "reboot", "cancel_reboot"}
+)
+
+# Node state flags under which Slurm starts no new jobs on the node.
+BLOCKING_STATES = frozenset(
+    {"DOWN", "DRAIN", "DRAINED", "DRAINING", "FAIL", "FAILING", "NOT_RESPONDING",
+     "MAINT", "POWER_DOWN", "POWERED_DOWN", "POWERING_DOWN", "FUTURE",
+     "REBOOT_ISSUED"}
+)
+
+NULL_STRINGS = frozenset({"", "(null)", "null", "none", "n/a", "unknown"})
+VALID_NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Slurm's explicit "no such node" answers; timeouts and controller errors differ.
+NOT_DEFINED_RE = re.compile(r"\bnot found\b|invalid node name", re.IGNORECASE)
+
+# One squeue format serves running and pending jobs. The free-text name is last
+# so a '|' inside a job name cannot shift the other columns.
+JOB_FORMAT = "%i|%T|%r|%S|%e|%l|%Y|%b|%C|%j"
+JOB_FIELDS = 10
+
+STALE_TOLERANCE = timedelta(seconds=60)  # a "future" start this close to now is due
+MAX_REASON_CHARS = 60
+MAX_PARTITIONS_SHOWN = 3
+EXIT_QUERY_ERROR, EXIT_NOT_DEFINED = 1, 2
+
+FOOTER = "Slurm estimates, not guarantees. --verbose: jobs, resources, evidence."
+VERDICT_STYLES = {"NOW": "bold green", "NO": "bold red", "UNKNOWN": "bold yellow"}
+
+
+# ============================================================================
+# Data models
+# ============================================================================
+
+
+@dataclass
+class CommandResult:
+    argv: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+    ok: bool
+    error: str | None = None
+
+
+class NodeLookupError(Exception):
+    """The node could not be inspected. `not_defined` means Slurm has no such node."""
+
+    def __init__(self, message: str, not_defined: bool = False) -> None:
+        super().__init__(message)
+        self.not_defined = not_defined
+
+
+@dataclass
+class Node:
+    name: str
+    state: str
+    flags: list[str]
+    partitions: list[str]
+    reason: str | None
+    cpu_total: int | None
+    cpu_alloc: int | None
+    mem_total_mb: int | None
+    mem_alloc_mb: int | None
+    gpu_total: int | None
+    gpu_alloc: int | None
+    gpu_type: str | None
+
+    @property
+    def blocking(self) -> list[str]:
+        return [f for f in self.flags if f in BLOCKING_STATES]
+
+    @property
+    def planned(self) -> bool:
+        return "PLANNED" in self.flags
+
+    @property
+    def gpu_free(self) -> int | None:
+        return _free(self.gpu_total, self.gpu_alloc)
+
+    @property
+    def cpu_free(self) -> int | None:
+        return _free(self.cpu_total, self.cpu_alloc)
+
+    @property
+    def mem_free(self) -> int | None:
+        return _free(self.mem_total_mb, self.mem_alloc_mb)
+
+
+@dataclass
+class Job:
+    job_id: str  # as squeue shows it, e.g. 34410224_1245 for an array task
+    state: str
+    reason: str
+    start: datetime | None
+    end: datetime | None
+    limit: str
+    sched_nodes: str
+    gres: str
+    cpus: str
+    name: str
+
+
+@dataclass
+class Plan:
+    node: Node
+    now: datetime
+    running: list[Job] | None  # None means the query failed
+    planned: list[Job] | None  # pending jobs scheduled on the node; None = failed
+    commands: list[str]
+
+
+@dataclass
+class Summary:
+    resource_label: str
+    resource_line: str
+    blockers: list[str]
+    hard_blocker: bool
+    next_line: str
+    verdict: str  # NOW | NO | UNKNOWN
+    reason: str
+
+
+Runner = Callable[[list[str]], CommandResult]
+
+
+# ============================================================================
+# Parsing
+# ============================================================================
+
+
+def is_null(value: str | None) -> bool:
+    return value is None or value.strip().lower() in NULL_STRINGS
+
+
+def to_int(value: str | None) -> int | None:
+    return int(value) if value and value.strip().isdigit() else None
+
+
+def _free(total: int | None, alloc: int | None) -> int | None:
+    return None if total is None or alloc is None else max(0, total - alloc)
+
+
+def parse_time(value: str | None) -> datetime | None:
+    """Parse '2026-11-09T12:25:36'; None for N/A, Unknown, or invalid values."""
+    if is_null(value):
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+
+
+def parse_state_flags(state: str | None) -> list[str]:
+    """Split 'MIXED+PLANNED' into ordered flags, dropping trailing Slurm symbols."""
+    flags: list[str] = []
+    for token in re.split(r"[+\s]+", state or ""):
+        token = token.rstrip("*~#$@-%!^").upper()
+        if token and token not in flags:
+            flags.append(token)
+    return flags
+
+
+def gpu_count(tres: str | None) -> int | None:
+    """GPU count from a TRES string such as 'cpu=8,gres/gpu=2'; None if not listed."""
+    match = re.search(r"(?:^|,)gres/gpu=(\d+)", tres or "")
+    return int(match.group(1)) if match else None
+
+
+_KEY_RE = re.compile(r"(?<!\S)([A-Za-z][\w/:.-]*)=")
+
+
+def parse_fields(text: str) -> dict[str, str]:
+    """Parse one `scontrol show node` record into key -> value."""
+    fields: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("Reason="):  # runs to end of line; may contain '=' and '['
+            fields["Reason"] = line[len("Reason="):].strip()
+            continue
+        hits = list(_KEY_RE.finditer(line))
+        for i, hit in enumerate(hits):
+            end = hits[i + 1].start() if i + 1 < len(hits) else len(line)
+            fields[hit.group(1)] = line[hit.end():end].strip()
+    return fields
+
+
+def parse_node(fields: dict[str, str]) -> Node:
+    state = fields.get("State", "UNKNOWN")
+    gpu_total = gpu_count(fields.get("CfgTRES"))
+    gres = re.search(r"gpu:([^:,(]+):\d", fields.get("Gres", ""))
+    reason = fields.get("Reason")
+    return Node(
+        name=fields["NodeName"],
+        state=state,
+        flags=parse_state_flags(state),
+        partitions=[p.strip() for p in fields.get("Partitions", "").split(",")
+                    if not is_null(p)],
+        reason=None if is_null(reason) else reason,
+        cpu_total=to_int(fields.get("CPUTot")),
+        cpu_alloc=to_int(fields.get("CPUAlloc")),
+        mem_total_mb=to_int(fields.get("RealMemory")),
+        mem_alloc_mb=to_int(fields.get("AllocMem")),
+        gpu_total=gpu_total,
+        # AllocTRES lists only what is allocated, so no gres/gpu entry means none.
+        gpu_alloc=(gpu_count(fields.get("AllocTRES")) or 0) if gpu_total else None,
+        gpu_type=gres.group(1) if gres else None,
+    )
+
+
+def expand_nodelist(expr: str | None) -> list[str]:
+    """Expand a Slurm hostlist such as 'compg[027,037-038],compa001' into node names."""
+    if is_null(expr):
+        return []
+    items: list[str] = []
+    depth, current = 0, ""
+    for ch in expr.strip():
+        depth += (ch == "[") - (ch == "]")
+        if ch == "," and depth == 0:
+            items.append(current)
+            current = ""
+        else:
+            current += ch
+    items.append(current)
+    names = [name for item in items if item.strip() for name in _expand_item(item.strip())]
+    return list(dict.fromkeys(names))
+
+
+def _expand_item(item: str) -> list[str]:
+    match = re.fullmatch(r"([^\[\]]*)\[([^\[\]]+)\](.*)", item)
+    if not match:
+        return [item]
+    prefix, ranges, suffix = match.groups()
+    names: list[str] = []
+    for rng in ranges.split(","):
+        low, _, high = rng.strip().partition("-")
+        if low.isdigit() and high.isdigit() and int(low) <= int(high) <= int(low) + 10000:
+            ids = [f"{n:0{len(low)}d}" for n in range(int(low), int(high) + 1)]
+        else:
+            ids = [rng.strip()]
+        for ident in ids:
+            names.extend(_expand_item(prefix + ident + suffix))
+    return names
+
+
+def parse_jobs(output: str) -> list[Job]:
+    """Parse squeue output in JOB_FORMAT; blank or malformed lines are skipped."""
+    jobs: list[Job] = []
+    for line in output.splitlines():
+        parts = [p.strip() for p in line.split("|", JOB_FIELDS - 1)]
+        if len(parts) != JOB_FIELDS:
+            continue
+        jobs.append(Job(
+            job_id=parts[0], state=parts[1].upper(), reason=parts[2],
+            start=parse_time(parts[3]), end=parse_time(parts[4]), limit=parts[5],
+            sched_nodes=parts[6], gres=parts[7], cpus=parts[8], name=parts[9],
+        ))
+    return jobs
+
+
+def scheduled_on(jobs: list[Job], node: str) -> list[Job]:
+    """Pending jobs whose SchedNodes include `node`, earliest predicted start first."""
+    mine = [j for j in jobs if j.state == "PENDING" and node in expand_nodelist(j.sched_nodes)]
+    return sorted(mine, key=lambda j: (j.start is None, j.start or datetime.max))
+
+
+# ============================================================================
+# Read-only Slurm access
+# ============================================================================
+
+
+def validate_readonly(argv: list[str]) -> None:
+    """Raise ValueError unless argv is an allowed read-only Slurm query."""
+    if not argv:
+        raise ValueError("Empty command is not allowed.")
+    binary = argv[0].rsplit("/", 1)[-1]
+    if binary == "scontrol" and any(a.lower() in FORBIDDEN_SCONTROL_WORDS for a in argv[1:]):
+        raise ValueError(f"Forbidden scontrol operation: {' '.join(argv)}")
+    head = (binary, *(a.lower() for a in argv[1:]))
+    if not any(head[:len(prefix)] == prefix for prefix in ALLOWED_COMMAND_PREFIXES):
+        raise ValueError(f"Command outside the read-only allowlist: {' '.join(argv)}")
+
+
+def run_slurm(argv: list[str], timeout: float = 20.0) -> CommandResult:
+    validate_readonly(argv)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except FileNotFoundError:
+        return CommandResult(argv, 127, "", "", False, f"Command not found: {argv[0]}")
+    except subprocess.TimeoutExpired:
+        return CommandResult(argv, 124, "", "", False, f"Timed out after {timeout:.0f}s")
+    error = None
+    if proc.returncode != 0:
+        error = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
+    return CommandResult(argv, proc.returncode, proc.stdout, proc.stderr,
+                         proc.returncode == 0, error)
+
+
+def lookup_error(node_name: str, res: CommandResult) -> NodeLookupError:
+    """Turn a failed `scontrol show node` into 'not defined' or a plain query failure."""
+    text = (res.error or res.stderr or res.stdout or "").strip()
+    message = text.splitlines()[0] if text else f"scontrol returned no data for '{node_name}'."
+    not_defined = res.returncode not in (124, 127) and bool(NOT_DEFINED_RE.search(text))
+    return NodeLookupError(message, not_defined)
+
+
+def collect(node_name: str, runner: Runner = run_slurm,
+            now: Callable[[], datetime] = datetime.now) -> Plan:
+    """Gather the node record, running jobs, and pending jobs scheduled on the node."""
+    commands: list[str] = []
+
+    def run(argv: list[str]) -> CommandResult:
+        commands.append(shlex.join(argv))
+        return runner(argv)
+
+    # scontrol, not sinfo, decides whether a node exists: sinfo omits nodes that
+    # belong to no partition, though scontrol still lists them.
+    res = run(["scontrol", "show", "node", node_name])
+    if not res.ok:
+        raise lookup_error(node_name, res)
+    fields = parse_fields(res.stdout)
+    if fields.get("NodeName") != node_name:
+        raise NodeLookupError(f"scontrol returned no record for '{node_name}'.")
+    node = parse_node(fields)
+
+    res = run(["squeue", "-w", node_name, "-h", "-o", JOB_FORMAT])
+    running = [j for j in parse_jobs(res.stdout) if j.state != "PENDING"] if res.ok else None
+
+    # A node in no partition cannot be a partition job's scheduled node.
+    planned: list[Job] | None = []
+    if node.partitions:
+        res = run(["squeue", "--start", "-h", "-p", ",".join(node.partitions), "-o", JOB_FORMAT])
+        planned = scheduled_on(parse_jobs(res.stdout), node_name) if res.ok else None
+    return Plan(node, now(), running, planned, commands)
+
+
+# ============================================================================
+# Assessment
+# ============================================================================
+
+
+def format_clock(dt: datetime, ref: datetime) -> str:
+    """HH:MM on the same calendar day as `ref`, else MM-DD HH:MM."""
+    return dt.strftime("%H:%M") if dt.date() == ref.date() else dt.strftime("%m-%d %H:%M")
+
+
+def format_interval(start: datetime | None, end: datetime | None, ref: datetime) -> str:
+    if start is None:
+        return "start UNKNOWN"
+    text = format_clock(start, ref)
+    return text + (f" -> {format_clock(end, start)}" if end else "")
+
+
+def next_line(plan: Plan) -> str:
+    """The earliest job Slurm predicts for this node, clearly labelled as an estimate."""
+    node, planned = plan.node, plan.planned
+    if not node.partitions:
+        return "not applicable (node is in no partition)"
+    if planned is None:
+        return "UNKNOWN (pending-job query failed)"
+    if not planned:
+        return "no pending job is predicted for this node" + (
+            " (yet node is PLANNED)" if node.planned else "")
+    job = planned[0]
+    text = f"job {job.job_id}" + (f" ({job.reason})" if job.reason else "") + ": "
+    text += format_interval(job.start, job.end, plan.now)
+    if job.start is None:
+        text += " [no valid estimate]"
+    elif job.start <= plan.now + STALE_TOLERANCE:
+        text += " [~now, still pending]"
+    else:
+        text += " [Slurm estimate]"
+    return text + (f" (+{len(planned) - 1} more)" if len(planned) > 1 else "")
+
+
+def summarize(plan: Plan) -> Summary:
+    """
+    Reduce the evidence to a verdict:
+
+      NO       Slurm state or allocation confirms the node cannot start a job now
+      NOW      node is schedulable and has unallocated resources; this does not
+               guarantee that any particular job will start
+      UNKNOWN  the evidence does not establish availability
+    """
+    node, planned = plan.node, plan.planned or []
+    has_gpus = bool(node.gpu_total)
+    blocked = bool(node.blocking) or not node.partitions  # node cannot start jobs
+
+    # --- free resources -----------------------------------------------------
+    if has_gpus:
+        label, free, total = "GPUs", node.gpu_free, node.gpu_total
+        kind = f"; {node.gpu_type}" if node.gpu_type else ""
+    else:
+        label, free, total = "CPUs", node.cpu_free, node.cpu_total
+        kind = "; node has no GPUs"
+    if free is None:
+        resources = "allocation not reported" + (" (node has no GPUs)" if not has_gpus else "")
+    elif blocked:
+        tail = kind if has_gpus else " (no GPUs)"
+        resources = f"{free}/{total} unallocated, but node cannot start jobs{tail}"
+    else:
+        resources = f"{free}/{total} free (unallocated by Slurm{kind})"
+
+    # --- blockers -------------------------------------------------------------
+    blockers: list[str] = []
+    if node.blocking:
+        text = ", ".join(node.blocking)
+        if node.reason:
+            reason = node.reason
+            text += ": " + (reason if len(reason) <= MAX_REASON_CHARS
+                            else reason[:MAX_REASON_CHARS - 1].rstrip() + "…")
+        blockers.append(text)
+    if not node.partitions:
+        blockers.append("in no partition")
+    if node.planned:
+        if planned:
+            ids = ", ".join(j.job_id for j in planned[:2])
+            more = f" (+{len(planned) - 2} more)" if len(planned) > 2 else ""
+            blockers.append(f"PLANNED; scheduled here: job {ids}{more}")
+        elif plan.planned is None:
+            blockers.append("PLANNED; pending-job query failed")
+        else:
+            blockers.append("PLANNED; no scheduled job identified")
+    elif planned:
+        blockers.append(f"job {planned[0].job_id} scheduled here")
+
+    exhausted = None
+    if not blocked:
+        if has_gpus and node.gpu_free == 0:
+            exhausted = "all GPUs allocated"
+        elif node.cpu_free == 0:
+            exhausted = "no CPUs unallocated"
+        elif node.mem_free == 0:
+            exhausted = "no memory unallocated"
+        if exhausted:
+            blockers.append(exhausted)
+
+    # --- verdict --------------------------------------------------------------
+    ends = sorted(j.end for j in plan.running or [] if j.end and j.state != "COMPLETING")
+    walltime = ""
+    if ends:
+        span = format_clock(ends[0], plan.now)
+        if ends[-1] != ends[0]:
+            span += f" to {format_clock(ends[-1], plan.now)}"
+        walltime = f" (running walltime limits end {span}; jobs may end earlier)"
+
+    if node.blocking:
+        verdict, why = "NO", "blocking node state; Slurm gives no return-to-service estimate"
+    elif not node.partitions:
+        verdict, why = "NO", "node is in no partition, so jobs cannot be scheduled on it"
+    elif exhausted:
+        # The node's own allocation confirms nothing is free, even if PLANNED.
+        verdict, why = "NO", f"{exhausted}; no Slurm release estimate{walltime}"
+    elif plan.running is None:
+        verdict, why = "UNKNOWN", "running-job query failed"
+    elif node.planned or planned:
+        verdict, why = "UNKNOWN", "idle resources may be reserved for planned jobs"
+    elif plan.planned is None:
+        verdict, why = "UNKNOWN", "pending-job query failed, planned jobs cannot be excluded"
+    elif node.cpu_free is None or node.mem_free is None:
+        verdict, why = "UNKNOWN", "node allocation not fully reported"
+    else:
+        counts = (f"{node.gpu_free} GPU(s), " if has_gpus else "") + f"{node.cpu_free} CPU(s)"
+        verdict = "NOW"
+        why = f"{counts} unallocated and no blocking state (account/partition limits not checked)"
+
+    return Summary(label, resources, blockers, blocked, next_line(plan), verdict, why)
+
+
+# ============================================================================
+# Output
+# ============================================================================
+
+
+def state_style(node: Node) -> str:
+    if node.blocking:
+        return "bold red"
+    if node.planned or {"MIXED", "ALLOCATED"} & set(node.flags):
+        return "bold yellow"
+    return "bold green" if "IDLE" in node.flags else "bold"
+
+
+def grid(rows: list[tuple[str, Text | str]]) -> Table:
+    """Label/value rows whose wrapped lines stay aligned under the value column."""
+    table = Table.grid(padding=(0, 1))
+    table.add_column(no_wrap=True, style="bold")
+    table.add_column()
+    for label, value in rows:
+        table.add_row(label + ":", value if isinstance(value, Text) else Text(value))
+    return table
+
+
+def render_summary(plan: Plan, console: Console) -> None:
+    node, s = plan.node, summarize(plan)
+    shown = ",".join(node.partitions[:MAX_PARTITIONS_SHOWN]) or "no partition"
+    if len(node.partitions) > MAX_PARTITIONS_SHOWN:
+        shown += f",+{len(node.partitions) - MAX_PARTITIONS_SHOWN}"
+    head = Text(node.name, style="bold")
+    head.append("  ")
+    head.append(node.state, style=state_style(node))
+    head.append(f"  [{shown}]  queried {plan.now.strftime('%H:%M:%S')}", style="dim")
+    console.print(head)
+
+    blocker = Text("; ".join(s.blockers) or "none reported",
+                   style=("red" if s.hard_blocker else "yellow") if s.blockers else "")
+    verdict = Text(s.verdict, style=VERDICT_STYLES[s.verdict])
+    verdict.append(f" - {s.reason}")
+    console.print(grid([
+        (s.resource_label, s.resource_line),
+        ("Blocker", blocker),
+        ("Next", s.next_line),
+        ("Available", verdict),
+    ]))
+    console.print(Text(FOOTER, style="dim italic"))
+
+
+def describe_job(job: Job, now: datetime) -> str:
+    gres = "" if is_null(job.gres) else job.gres.replace("gres/", "") + ", "
+    text = f"{job.job_id}  {job.name}  {job.state}"
+    if job.state == "PENDING":
+        text += f" ({job.reason})"
+    return text + f"  {gres}{job.cpus} CPU  limit {job.limit}  " + format_interval(
+        job.start, job.end, now)
+
+
+def render_details(plan: Plan, console: Console) -> None:
+    node = plan.node
+    mem = (f"{node.mem_alloc_mb}/{node.mem_total_mb} MiB"
+           if node.mem_total_mb is not None else "not reported")
+    rows: list[tuple[str, Text | str]] = [
+        ("State", node.state),
+        ("Partitions", ", ".join(node.partitions) or "none"),
+        ("Allocated", f"CPUs {node.cpu_alloc}/{node.cpu_total}, memory {mem}"
+                      f", GPUs {node.gpu_alloc}/{node.gpu_total}"),
+    ]
+    if node.reason:
+        rows.append(("Reason", node.reason))
+    console.print()
+    console.print(grid(rows))
+    for title, jobs in (("Running on this node", plan.running),
+                        ("Pending jobs scheduled on this node (Slurm estimates)", plan.planned)):
+        console.print(Text(f"\n{title}", style="bold underline"))
+        if jobs is None:
+            console.print(Text("  UNKNOWN (query failed)", style="yellow"))
+        for job in jobs or []:
+            console.print(Text("  " + describe_job(job, plan.now)))
+        if jobs == []:
+            console.print(Text("  none", style="dim"))
+    console.print(Text("\nCommands executed", style="bold underline"))
+    for command in plan.commands:
+        console.print(Text(f"  $ {command}"))
+
+
+def render_plan(plan: Plan, console: Console, verbose: bool = False) -> None:
+    render_summary(plan, console)
+    if verbose:
+        render_details(plan, console)
+
+
+def render_error(node_name: str, err: NodeLookupError, console: Console) -> None:
+    """Keep 'not defined in Slurm' distinct from 'the query failed'."""
+    head = Text(node_name, style="bold")
+    if err.not_defined:
+        head.append("  NOT DEFINED in Slurm", style="bold red")
+        rows = [
+            ("Slurm", f'scontrol show node: "{err}"'),
+            ("Meaning", "no node record exists. A DOWN or DRAINED node would still "
+                        "have one, so this is not an unavailable node."),
+            ("Check", "the node name. sinfo only lists nodes that belong to a "
+                      "partition, so it cannot confirm a name either way."),
+        ]
+    else:
+        head.append("  QUERY FAILED", style="bold yellow")
+        rows = [
+            ("Slurm", str(err)),
+            ("Meaning", "Slurm could not be queried; this does not show whether "
+                        "the node exists or is available."),
+        ]
+    console.print(head)
+    console.print(grid(rows))
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="nodeplan",
+        description=(
+            "Read-only Slurm node availability check. Prints a short summary: node "
+            "state, free GPUs, main blocker, the next job Slurm predicts for the "
+            "node, and whether the node can be used now. Slurm predictions are "
+            "estimates; availability is reported as UNKNOWN when not established."
+        ),
+        epilog=(
+            "Examples: nodeplan compg027; nodeplan compg037 --verbose. "
+            "Exit codes: 0 ok, 1 usage or query error, 2 node not defined in Slurm."
+        ),
+    )
+    parser.add_argument("node", metavar="NODE", help="Single node name, e.g. compg027.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Also show running jobs, planned jobs, node resources, "
+                             "and the commands executed.")
+    parser.add_argument("--no-color", action="store_true",
+                        help="Disable ANSI color and styling in terminal output.")
+    return parser
+
+
+def main(argv: list[str] | None = None, runner: Runner = run_slurm,
+         console: Console | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    out = console or Console(no_color=args.no_color)
+    node = args.node.strip()
+    if not VALID_NODE_RE.match(node):
+        out.print(Text(f"Error: '{node}' is not a single node name (hostlist expressions "
+                       "and special characters are not accepted).", style="bold red"))
+        return EXIT_QUERY_ERROR
+    try:
+        plan = collect(node, runner=runner)
+    except NodeLookupError as err:
+        render_error(node, err, out)
+        return EXIT_NOT_DEFINED if err.not_defined else EXIT_QUERY_ERROR
+    render_plan(plan, out, verbose=args.verbose)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
