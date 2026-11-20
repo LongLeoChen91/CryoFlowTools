@@ -1,0 +1,351 @@
+#!/apps/strubi/software/packages/miniforge3/envs/miss-alignment/bin/python
+"""
+split_star_by_class
+
+Split a RELION Class3D STAR file into one STAR file per rlnClassNumber.
+
+Preserves original particle metadata (including orientations, origins, and
+coordinates) and all non-particle STAR blocks, such as data_optics. Does not
+re-align particles.
+
+Example:
+    split_star_by_class Class3D/job116/run_it025_data.star \
+        -o Round21_split/derived/job116_K8 \
+        --expected-k 8 --expected-total 12775 --dry-run
+
+    split_star_by_class Class3D/job116/run_it025_data.star \
+        -o Round21_split/derived/job116_K8 \
+        --expected-k 8 --expected-total 12775
+
+Output filenames:
+    particles_job116_class001_<count>.star
+    ...
+    particles_job116_class008_<count>.star
+
+When --expected-k is supplied, zero-particle classes in 1..K are recorded in
+class_particle_counts.csv and split_manifest.json without writing empty STAR
+files. --dry-run validates the input without writing files, even if the output
+directory already exists. Normal execution never overwrites existing outputs.
+
+Developed and maintained by Long Chen.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import tempfile
+
+import numpy as np
+import pandas as pd
+import starfile
+
+
+CLASS_COLUMN = "rlnClassNumber"
+IDENTITY_COLUMN = "rlnImageName"
+STRING_COLUMNS = [
+    "rlnImageName",
+    "rlnTomoParticleName",
+    "rlnTomoParticleId",
+    "rlnTomoName",
+    "rlnMicrographName",
+    "rlnOpticsGroupName",
+]
+FLOAT_FORMAT = "%.15g"
+
+
+def find_particle_block(blocks: dict, selected: str | None) -> tuple[str, pd.DataFrame, str]:
+    """Identify the single STAR table containing rlnClassNumber."""
+    if selected is not None and selected not in blocks:
+        raise ValueError(f"STAR block {selected!r} not found. Available: {list(blocks)}")
+
+    names = [selected] if selected is not None else list(blocks)
+    matches = []
+    for name in names:
+        table = blocks[name]
+        if not isinstance(table, pd.DataFrame):
+            if selected is not None:
+                raise ValueError(f"STAR block {name!r} is not a table.")
+            continue
+        if not table.columns.is_unique:
+            raise ValueError(f"Duplicate column names in block {name!r}.")
+        columns = [str(c) for c in table.columns if str(c).lstrip("_").lower() == CLASS_COLUMN.lower()]
+        if len(columns) > 1:
+            raise ValueError(f"Ambiguous class-number columns in block {name!r}: {columns}")
+        if columns:
+            matches.append((name, table, columns[0]))
+
+    if not matches:
+        raise ValueError("No particle table with rlnClassNumber found. Use --block if needed.")
+    if len(matches) > 1:
+        raise ValueError(f"Multiple class-number tables: {[name for name, _, _ in matches]}; use --block.")
+    return matches[0]
+
+
+def validate_classes(particles: pd.DataFrame, column: str, expected_k: int | None) -> pd.Series:
+    """Return exact positive integer class IDs, rejecting missing or invalid values."""
+    if particles.empty:
+        raise ValueError("The particle table is empty.")
+
+    raw = particles[column]
+    if raw.isna().any() or raw.map(lambda v: isinstance(v, bool)).any():
+        raise ValueError("rlnClassNumber must contain positive integers.")
+    try:
+        values = pd.to_numeric(raw, errors="raise")
+    except (ValueError, TypeError) as exc:
+        raise ValueError("rlnClassNumber must contain positive integers.") from exc
+    if values.isna().any() or not np.isfinite(values.to_numpy(dtype=float)).all():
+        raise ValueError("rlnClassNumber must contain positive integers.")
+    classes = values.astype("int64")
+    if not (values > 0).all() or not (values == classes).all():
+        raise ValueError("rlnClassNumber must contain positive integers.")
+
+    if expected_k is not None:
+        unexpected = sorted(set(int(x) for x in classes.unique()) - set(range(1, expected_k + 1)))
+        if unexpected:
+            raise ValueError(f"Classes out of expected 1..{expected_k} range: {unexpected}")
+    return classes
+
+
+def validate_identity(particles: pd.DataFrame) -> None:
+    """Require non-empty, unique rlnImageName particle identifiers."""
+    if IDENTITY_COLUMN not in particles.columns:
+        raise ValueError(f"Missing identity column: {IDENTITY_COLUMN}")
+    ids = particles[IDENTITY_COLUMN]
+    if ids.isna().any():
+        raise ValueError(f"{IDENTITY_COLUMN} contains missing values.")
+    stripped = ids.astype(str).str.strip()
+    if stripped.eq("").any() or stripped.isin({".", "?"}).any():
+        raise ValueError(f"{IDENTITY_COLUMN} contains missing or empty values.")
+    if not ids.is_unique:
+        examples = ids[ids.duplicated()].drop_duplicates().head(5).tolist()
+        raise ValueError(f"Duplicate {IDENTITY_COLUMN} values in source STAR (examples: {examples}).")
+
+
+def validate_optics(blocks: dict, particles: pd.DataFrame) -> None:
+    """Check that particle rlnOpticsGroup references exist in data_optics when present."""
+    if "rlnOpticsGroup" not in particles.columns:
+        return
+    optics = blocks.get("optics")
+    if not isinstance(optics, pd.DataFrame) or "rlnOpticsGroup" not in optics.columns:
+        raise ValueError("Particles contain rlnOpticsGroup, but a valid data_optics table is missing.")
+    defined = set(pd.to_numeric(optics["rlnOpticsGroup"], errors="raise").astype("int64"))
+    referenced = set(pd.to_numeric(particles["rlnOpticsGroup"], errors="raise").astype("int64"))
+    undefined = sorted(referenced - defined)
+    if undefined:
+        raise ValueError(f"Undefined rlnOpticsGroup reference(s) in particles: {undefined}")
+
+
+def derive_prefix(input_star: Path) -> str:
+    """Derive output filename prefix from jobNNN parent directory or file stem."""
+    parent_name = input_star.parent.name or input_star.expanduser().resolve().parent.name
+    job_match = re.fullmatch(r"job(\d+)", parent_name)
+    if job_match:
+        prefix = f"job{job_match.group(1)}"
+    else:
+        prefix = re.sub(r"_data$", "", input_star.stem) or input_star.stem
+    if prefix in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix):
+        raise ValueError(f"Input STAR name cannot safely form output filenames: {prefix!r}")
+    return prefix
+
+
+def verify_written_star(
+    target: Path,
+    expected_blocks: dict,
+    particle_block: str,
+) -> None:
+    """Read back a written class STAR file and verify particle and non-particle blocks."""
+    check = starfile.read(target, always_dict=True, parse_as_string=STRING_COLUMNS)
+    if list(check.keys()) != list(expected_blocks.keys()):
+        raise RuntimeError(f"Post-write block mismatch in {target.name}")
+    for block_name, expected in expected_blocks.items():
+        actual = check[block_name]
+        if isinstance(expected, pd.DataFrame):
+            try:
+                pd.testing.assert_frame_equal(
+                    actual,
+                    expected,
+                    check_dtype=False,
+                    check_exact=False,
+                    rtol=1e-12,
+                    atol=1e-12,
+                )
+            except AssertionError as exc:
+                raise RuntimeError(
+                    f"Post-write validation failed in {target.name} ({block_name})"
+                ) from exc
+        elif actual != expected:
+            raise RuntimeError(f"Post-write metadata mismatch in {target.name} ({block_name})")
+
+
+def split_star_by_class(
+    input_star: Path,
+    output_dir: Path,
+    *,
+    block: str | None = None,
+    expected_k: int | None = None,
+    expected_total: int | None = None,
+    dry_run: bool = False,
+) -> None:
+    if not input_star.is_file():
+        raise FileNotFoundError(f"Input STAR not found: {input_star}")
+
+    output_exists = output_dir.exists() or output_dir.is_symlink()
+    if not dry_run and output_exists:
+        raise FileExistsError(f"Output directory already exists: {output_dir}")
+
+    blocks = starfile.read(input_star, always_dict=True, parse_as_string=STRING_COLUMNS)
+    name, particles, class_column = find_particle_block(blocks, block)
+    validate_identity(particles)
+    validate_optics(blocks, particles)
+    class_ids = validate_classes(particles, class_column, expected_k)
+
+    if expected_total is not None and len(particles) != expected_total:
+        raise ValueError(f"Expected {expected_total:,} particles, found {len(particles):,}.")
+
+    observed = sorted(int(x) for x in class_ids.unique())
+    all_classes = list(range(1, expected_k + 1)) if expected_k is not None else observed
+    empty_classes = sorted(set(all_classes) - set(observed))
+    prefix = derive_prefix(input_star)
+
+    entries = []
+    for cls in all_classes:
+        count = int((class_ids == cls).sum())
+        filename = f"particles_{prefix}_class{cls:03d}_{count}.star" if count > 0 else None
+        entries.append({"class_id": cls, "particles": count, "star_file": filename})
+
+    if sum(row["particles"] for row in entries) != len(particles):
+        raise RuntimeError("Particle conservation check failed.")
+
+    print(f"Input: {input_star}")
+    print(f"Particle block: {name}; class column: {class_column}")
+    if expected_k is not None:
+        empty_note = f" (empty: {empty_classes})" if empty_classes else ""
+        print(
+            f"Particles: {len(particles):,}; unique IDs: confirmed; "
+            f"populated classes: {len(observed)}/{expected_k}{empty_note}"
+        )
+    else:
+        print(f"Particles: {len(particles):,}; unique IDs: confirmed; classes: {len(observed)}")
+    for row in entries:
+        label = row["star_file"] if row["star_file"] is not None else "(empty; no STAR written)"
+        print(f"  Class {row['class_id']:03d}: {row['particles']:,} -> {label}")
+    if dry_run and output_exists:
+        print(f"Output: {output_dir} (already exists; non-dry-run requires a new directory)")
+    else:
+        print(f"Output: {output_dir}")
+    if dry_run:
+        print("DRY RUN PASSED: no files written.")
+        return
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent))
+    try:
+        output_ids: set[str] = set()
+        for row in entries:
+            if row["star_file"] is None:
+                continue
+            cls = row["class_id"]
+            subset = particles.loc[class_ids == cls].copy().reset_index(drop=True)
+            subset_ids = set(subset[IDENTITY_COLUMN])
+            if output_ids.intersection(subset_ids):
+                raise ValueError(f"Particle IDs overlap in class {cls}.")
+            output_ids.update(subset_ids)
+
+            output_blocks = {
+                bname: (
+                    subset
+                    if bname == name
+                    else bdata.copy()
+                    if isinstance(bdata, pd.DataFrame)
+                    else bdata
+                )
+                for bname, bdata in blocks.items()
+            }
+            target = staging / row["star_file"]
+            starfile.write(output_blocks, target, float_format=FLOAT_FORMAT)
+            verify_written_star(target, output_blocks, name)
+
+        if output_ids != set(particles[IDENTITY_COLUMN]):
+            raise RuntimeError("Output particle identities do not exactly match the input.")
+
+        csv_rows = [
+            {
+                "class_id": row["class_id"],
+                "particles": row["particles"],
+                "star_file": row["star_file"] or "",
+            }
+            for row in entries
+        ]
+        pd.DataFrame(csv_rows).to_csv(staging / "class_particle_counts.csv", index=False)
+        (staging / "split_manifest.json").write_text(
+            json.dumps(
+                {
+                    "source_star": str(input_star.resolve()),
+                    "particle_block": name,
+                    "class_column": class_column,
+                    "identity_column": IDENTITY_COLUMN,
+                    "expected_k": expected_k,
+                    "total_particles": len(particles),
+                    "empty_classes": empty_classes,
+                    "classes": entries,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        if output_dir.exists() or output_dir.is_symlink():
+            raise FileExistsError(f"Output created concurrently: {output_dir}")
+        os.rename(staging, output_dir)
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+    print("PASS: all particles conserved, each class verified, source unchanged.")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("input_star", type=Path)
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=Path("by_class"),
+        help="New output directory (default: by_class).",
+    )
+    parser.add_argument("--block", help="Particle STAR data-block name; auto-detected by default.")
+    parser.add_argument("--expected-k", type=int, help="Expected number of classes (1..K).")
+    parser.add_argument("--expected-total", type=int, help="Expected total particle count.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and print the plan without writing files.",
+    )
+    args = parser.parse_args(argv)
+    if args.expected_k is not None and args.expected_k < 1:
+        parser.error("--expected-k must be positive")
+    if args.expected_total is not None and args.expected_total < 1:
+        parser.error("--expected-total must be positive")
+    try:
+        split_star_by_class(
+            args.input_star,
+            args.output,
+            block=args.block,
+            expected_k=args.expected_k,
+            expected_total=args.expected_total,
+            dry_run=args.dry_run,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
+
+
+if __name__ == "__main__":
+    main()

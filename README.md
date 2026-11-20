@@ -14,6 +14,7 @@ workflows on HPC clusters.
 | `class_distribution` | `relion/` | Tracks RELION Class3D class distributions across iterations |
 | `compare_class3d_jobs` | `relion/` | Compares particle class assignments between two RELION Class3D `*_data.star` files |
 | `class_pool_merge` | `relion/` | Validates and merges manually assigned Class3D pools with frozen-pool preservation and particle lineage |
+| `split_star_by_class` | `relion/` | Splits a RELION Class3D STAR file into one file per `rlnClassNumber` while preserving particle metadata and optics |
 | `split_star_by_tomo` | `relion/` | Splits a RELION STAR file into one file per `rlnTomoName` or `rlnMicrographName` |
 | `merge_star_files` | `relion/` | Merges compatible RELION STAR files while preserving particle metadata and other blocks |
 | `m_progressive` | `m/` | Prepares RELION-to-M inputs and generates a progressive refinement shell script |
@@ -30,7 +31,7 @@ pip install -r requirements.txt
 The scripts are standalone executables. Make them executable if needed:
 
 ```bash
-chmod +x hpc/gpuview hpc/nodeplan hpc/jobdiag relion/class_distribution relion/compare_class3d_jobs relion/class_pool_merge relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
+chmod +x hpc/gpuview hpc/nodeplan hpc/jobdiag relion/class_distribution relion/compare_class3d_jobs relion/class_pool_merge relion/split_star_by_class relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
 ```
 
 `m_resolution` and `m_progressive` use only the Python standard library.
@@ -227,6 +228,22 @@ particle STAR files are rejected before parsing can discard particles or metadat
 Particle column sets must agree within each merged pool; no columns are silently
 dropped.
 
+### split_star_by_class
+
+Split a RELION Class3D `*_data.star` file into one STAR file per
+`rlnClassNumber`, preserving particle metadata and non-particle blocks
+such as `data_optics`:
+
+```bash
+relion/split_star_by_class Class3D/job116/run_it025_data.star \
+    -o Round21_split/derived/job116_K8
+```
+
+Outputs are written to a new directory and never overwrite existing files.
+Optional flags include `--dry-run` (validate input and inspect class counts
+without writing files, even if the output directory already exists),
+`--expected-k`, and `--expected-total`.
+
 ### split_star_by_tomo
 
 Split a RELION STAR file into one STAR file per tomogram or micrograph.
@@ -253,9 +270,10 @@ relion/split_star_by_tomo run_data.star --strip-tomostar-suffix
 
 ### merge_star_files
 
-Merge compatible STAR files (e.g. those produced by `split_star_by_tomo`)
-back into a single file. Non-particle blocks such as `data_optics` are
-preserved when they are identical across all inputs:
+Merge compatible STAR files (e.g. those produced by `split_star_by_tomo`
+or `split_star_by_class`) back into a single file. Non-particle blocks
+such as `data_optics` are preserved when they agree across inputs, and
+duplicate `rlnImageName` values are rejected:
 
 ```bash
 relion/merge_star_files \
@@ -265,6 +283,9 @@ relion/merge_star_files \
     by_tomo/L3_pos01_ts_006.star \
     --output merged_L3.star
 ```
+
+Use `--dry-run` to validate inputs without writing files; existing outputs
+are never overwritten unless `--overwrite` is supplied.
 
 ### missali_report
 
