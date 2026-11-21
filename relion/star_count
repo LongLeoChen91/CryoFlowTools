@@ -1,0 +1,108 @@
+#!/apps/strubi/software/packages/miniforge3/envs/miss-alignment/bin/python
+"""
+star_count
+
+Print exact particle row counts from one or more RELION STAR files.
+
+Usage:
+    star_count Refine3D/job097/run_data.star
+    star_count Class3D/job119/run_it025_data.star --by-class
+    star_count path/to/*.star
+
+Developed and maintained by Long Chen.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+import pandas as pd
+import starfile
+
+
+PARTICLE_COLUMNS = (
+    "rlnImageName",
+    "rlnTomoParticleName",
+    "rlnTomoName",
+    "rlnMicrographName",
+)
+
+
+def particle_table(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        raise FileNotFoundError("STAR file not found")
+    data = starfile.read(path)
+    if isinstance(data, pd.DataFrame):
+        return data
+    if not isinstance(data, dict):
+        raise ValueError("Unsupported STAR content")
+    if isinstance(data.get("particles"), pd.DataFrame):
+        return data["particles"]
+
+    candidates = [
+        (name, table)
+        for name, table in data.items()
+        if isinstance(table, pd.DataFrame)
+        and any(col in table.columns for col in PARTICLE_COLUMNS)
+    ]
+    if len(candidates) != 1:
+        raise ValueError(
+            "Cannot identify a unique particle table; "
+            f"candidate blocks: {[name for name, _ in candidates]}"
+        )
+    return candidates[0][1]
+
+
+def format_class_counts(series: pd.Series) -> list[tuple[object, int]]:
+    """Count particles per rlnClassNumber, sorting integer classes numerically."""
+    if series.empty:
+        return []
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().all() and (numeric == numeric.astype("int64")).all():
+        counts = numeric.astype("int64").value_counts().sort_index()
+        return [(int(klass), int(count)) for klass, count in counts.items()]
+    counts = series.value_counts(dropna=False).sort_index()
+    return [(klass, int(count)) for klass, count in counts.items()]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Print exact particle row counts from one or more RELION STAR files."
+    )
+    parser.add_argument("star_files", type=Path, nargs="+", metavar="STAR")
+    parser.add_argument(
+        "--by-class",
+        action="store_true",
+        help="Show exact counts per rlnClassNumber",
+    )
+    args = parser.parse_args(argv)
+
+    failed = False
+    total_particles = 0
+    counted_files = 0
+    for path in args.star_files:
+        try:
+            table = particle_table(path)
+            count = len(table)
+            total_particles += count
+            counted_files += 1
+            print(f"{count:,}\t{path}")
+            if args.by_class:
+                if "rlnClassNumber" not in table.columns:
+                    print("  No rlnClassNumber column")
+                else:
+                    for klass, cls_count in format_class_counts(table["rlnClassNumber"]):
+                        print(f"  Class {klass}: {cls_count:,}")
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"ERROR: {path}: {exc}", file=sys.stderr)
+            failed = True
+
+    if len(args.star_files) > 1 and counted_files > 1:
+        print(f"{total_particles:,}\ttotal")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

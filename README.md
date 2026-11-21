@@ -11,6 +11,7 @@ workflows on HPC clusters.
 | `nodeplan` | `hpc/` | Read-only Slurm node availability check: state, free GPUs, blockers, and predicted schedule |
 | `jobdiag` | `hpc/` | Read-only Slurm job diagnostics for pending reasons, resource fit, and scheduler state |
 | `missali_report` | `missalignment/` | Summarises MissAlignment `*_alignment_loss.json` results |
+| `star_count` | `relion/` | Prints exact particle counts (and optional per-class counts) from one or more RELION STAR files |
 | `class_distribution` | `relion/` | Tracks RELION Class3D class distributions across iterations |
 | `compare_class3d_jobs` | `relion/` | Compares particle class assignments between two RELION Class3D `*_data.star` files |
 | `class_pool_merge` | `relion/` | Validates and merges manually assigned Class3D pools with frozen-pool preservation and particle lineage |
@@ -31,7 +32,7 @@ pip install -r requirements.txt
 The scripts are standalone executables. Make them executable if needed:
 
 ```bash
-chmod +x hpc/gpuview hpc/nodeplan hpc/jobdiag relion/class_distribution relion/compare_class3d_jobs relion/class_pool_merge relion/split_star_by_class relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
+chmod +x hpc/gpuview hpc/nodeplan hpc/jobdiag relion/star_count relion/class_distribution relion/compare_class3d_jobs relion/class_pool_merge relion/split_star_by_class relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
 ```
 
 `m_resolution` and `m_progressive` use only the Python standard library.
@@ -85,6 +86,17 @@ hpc/jobdiag 34378338 --partition gpu_interactive
 `jobdiag` is strictly read-only: it inspects Slurm state but never submits, cancels, holds, releases, requeues, or modifies jobs.
 
 > Scheduler-visible evidence can be incomplete. When the exact blocker cannot be established reliably, `jobdiag` reports it as unknown rather than guessing.
+
+### star_count
+
+Print exact particle counts from one or more RELION STAR files (use
+`--by-class` to include per-class counts):
+
+```bash
+relion/star_count Refine3D/job097/run_data.star
+relion/star_count Class3D/job119/run_it025_data.star --by-class
+relion/star_count Round02_split/*.star
+```
 
 ### class_distribution
 
