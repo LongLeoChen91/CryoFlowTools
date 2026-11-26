@@ -16,6 +16,7 @@ workflows on HPC clusters.
 | `compare_class3d_jobs` | `relion/` | Compares particle class assignments between two RELION Class3D `*_data.star` files |
 | `class_pool_merge` | `relion/` | Validates and merges manually assigned Class3D pools with frozen-pool preservation and particle lineage |
 | `split_star_by_class` | `relion/` | Splits a RELION Class3D STAR file into one file per `rlnClassNumber` while preserving particle metadata and optics |
+| `split_star_by_class_rawmeta` | `relion/` | Splits a RELION Class3D STAR file by `rlnClassNumber` while restoring particle metadata and optics from an original raw STAR |
 | `split_star_by_tomo` | `relion/` | Splits a RELION STAR file into one file per `rlnTomoName` or `rlnMicrographName` |
 | `merge_star_files` | `relion/` | Merges compatible RELION STAR files while preserving particle metadata and other blocks |
 | `m_progressive` | `m/` | Prepares RELION-to-M inputs and generates a progressive refinement shell script |
@@ -32,7 +33,7 @@ pip install -r requirements.txt
 The scripts are standalone executables. Make them executable if needed:
 
 ```bash
-chmod +x hpc/gpuview hpc/nodeplan hpc/jobdiag relion/star_count relion/class_distribution relion/compare_class3d_jobs relion/class_pool_merge relion/split_star_by_class relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
+chmod +x hpc/gpuview hpc/nodeplan hpc/jobdiag relion/star_count relion/class_distribution relion/compare_class3d_jobs relion/class_pool_merge relion/split_star_by_class relion/split_star_by_class_rawmeta relion/split_star_by_tomo relion/merge_star_files missalignment/missali_report m/m_resolution m/m_progressive
 ```
 
 `m_resolution` and `m_progressive` use only the Python standard library.
@@ -255,6 +256,23 @@ Outputs are written to a new directory and never overwrite existing files.
 Optional flags include `--dry-run` (validate input and inspect class counts
 without writing files, even if the output directory already exists),
 `--expected-k`, and `--expected-total`.
+
+### split_star_by_class_rawmeta
+
+Split a RELION Class3D `*_data.star` file by `rlnClassNumber` while
+restoring all output particle metadata, row order, and non-particle blocks
+(such as `data_optics`) from an original raw STAR file matched by
+`rlnImageName`:
+
+```bash
+relion/split_star_by_class_rawmeta Class3D/job126/run_it025_data.star \
+    --raw-star FV3_manual34_Z1500_10A_3D.star \
+    -o Nucleosome_Reclassification_V2/job126_K16_split_rawmeta
+```
+
+Outputs are written to a new directory and never overwrite existing files.
+Optional flags include `--dry-run`, `--expected-k`, `--expected-total`,
+and `--expected-raw-total`.
 
 ### split_star_by_tomo
 
